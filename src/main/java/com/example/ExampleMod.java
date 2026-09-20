@@ -57,7 +57,7 @@ public class ExampleMod implements ModInitializer {
     private static int actionbarTicks = 0;
 
     // Modifier
-    public static boolean blockDeleteEnabled = true; // NEU: Block-Löschen als Modifier ein-/ausschaltbar
+    public static boolean blockDeleteEnabled = true;
     public static boolean sharedHearts = false;
     public static float currentSharedHealth = 20.0f;
     private static boolean syncingHealth = false;
@@ -69,7 +69,7 @@ public class ExampleMod implements ModInitializer {
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
 
-    // Multi-Player Live Radar Tracking
+    // Multi-Player Live-Radar
     private static int banVersion = 0;
     private static final Map<String, Map<Long, Integer>> WORLD_CLEANED_CHUNKS = new HashMap<>();
 
@@ -176,10 +176,7 @@ public class ExampleMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        // Automatischer Reset beim Laden oder Erstellen einer Welt
-        ServerLifecycleEvents.SERVER_STARTING.register(server -> {
-            resetChallengeState();
-        });
+        ServerLifecycleEvents.SERVER_STARTING.register(server -> resetChallengeState());
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
@@ -242,7 +239,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Tödlichen Schaden abfangen: Kein Respawn-Screen, keine Vanilla-Nachricht, sofort Spectator
+        // 1. Tödlichen Schaden abfangen
         ServerLivingEntityEvents.ALLOW_DEATH.register((entity, damageSource, damageAmount) -> {
             if (entity instanceof ServerPlayer player && isRunning) {
                 ServerLevel sl = (ServerLevel) player.level();
@@ -261,7 +258,7 @@ public class ExampleMod implements ModInitializer {
             return true;
         });
 
-        // 2. Platzieren verbotener Blöcke verbrennen (nur aktiv wenn Block-Despawn an ist)
+        // 2. Platzieren verbotener Blöcke
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             if (!blockDeleteEnabled) return InteractionResult.PASS;
 
@@ -295,7 +292,7 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 3. Kontinuierlicher Server-Tick
+        // 3. Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (HOSTS.isEmpty() && !server.getPlayerList().getPlayers().isEmpty()) {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
@@ -324,19 +321,18 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // --- MULTI-PLAYER LIVE RADAR (Für alle 5 Spieler gleichzeitig) ---
+            // Multi-Player Live-Radar für alle 5 Spieler
             if (blockDeleteEnabled && !BANNED_BLOCKS.isEmpty()) {
                 List<ServerPlayer> players = server.getPlayerList().getPlayers();
                 if (!players.isEmpty()) {
-                    long deadline = System.currentTimeMillis() + 4; // Strenges 4ms Budget pro Tick
+                    long deadline = System.currentTimeMillis() + 4;
 
-                    // Prüft Ringe 0 bis 22 um jeden einzelnen Spieler gleichberechtigt
                     for (int r = 0; r <= 22 && System.currentTimeMillis() < deadline; r++) {
                         for (ServerPlayer player : players) {
                             if (System.currentTimeMillis() >= deadline) break;
                             if (player.level() instanceof ServerLevel sl) {
-                                int px = player.chunkPosition().x;
-                                int pz = player.chunkPosition().z;
+                                int px = player.getBlockX() >> 4;
+                                int pz = player.getBlockZ() >> 4;
                                 cleanRingForPlayer(sl, px, pz, r);
                             }
                         }
@@ -346,7 +342,7 @@ public class ExampleMod implements ModInitializer {
 
             if (!isRunning || isPaused) return;
 
-            // Blockwechsel-Logik (nur aktiv wenn Block-Despawn an ist)
+            // Blockwechsel
             if (blockDeleteEnabled) {
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                     if (player.onGround()) {
@@ -360,7 +356,7 @@ public class ExampleMod implements ModInitializer {
                             } else if (!currentBlock.equals(lastBlock)) {
                                 if (!WHITELIST.contains(lastBlock) && !BANNED_BLOCKS.contains(lastBlock)) {
                                     BANNED_BLOCKS.add(lastBlock);
-                                    banVersion++; // Löst bei allen 5 Spielern sofortige Neubereinigung aus
+                                    banVersion++;
 
                                     if (showBroadcasts) {
                                         server.getPlayerList().broadcastSystemMessage(
@@ -383,6 +379,15 @@ public class ExampleMod implements ModInitializer {
                                                 }
                                             }
                                         }
+
+                                        for (ServerPlayer p : serverLevel.players()) {
+                                            int cx = p.getBlockX() >> 4;
+                                            int cz = p.getBlockZ() >> 4;
+                                            LevelChunk c = serverLevel.getChunkSource().getChunk(cx, cz, false);
+                                            if (c != null) {
+                                                clearChunkDirect(serverLevel, c);
+                                            }
+                                        }
                                     }
                                 }
                                 PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
@@ -394,9 +399,8 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Reinigt ringförmig um die Position eines Spielers
     private static void cleanRingForPlayer(ServerLevel level, int px, int pz, int r) {
-        String worldKey = level.dimension().location().toString();
+        String worldKey = level.dimension().toString();
         Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
 
         if (r == 0) {
@@ -417,7 +421,7 @@ public class ExampleMod implements ModInitializer {
     private static void cleanChunkIfDue(ServerLevel level, int cx, int cz, Map<Long, Integer> cleanedMap) {
         long key = chunkKey(cx, cz);
         if (cleanedMap.getOrDefault(key, -1) == banVersion) {
-            return; // Bereits sauber
+            return;
         }
         LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, false);
         if (chunk != null) {
@@ -617,7 +621,6 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Menü-Layout: Links Welt (10, 11, 12) | Mitte Schalter (13) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -642,28 +645,28 @@ public class ExampleMod implements ModInitializer {
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 10) { // Wasser
+                        } else if (slotId == 10) {
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 11) { // Lava
+                        } else if (slotId == 11) {
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 12) { // Obsidian
+                        } else if (slotId == 12) {
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) { // NEU: Block-Despawn Modifier Toggle
+                        } else if (slotId == 13) {
                             blockDeleteEnabled = !blockDeleteEnabled;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eBlock-Despawn §7» " + (blockDeleteEnabled ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
-                        } else if (slotId == 14) { // Geteilte Herzen
+                        } else if (slotId == 14) {
                             toggleSharedHearts(sl.getServer(), sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) { // UHC
+                        } else if (slotId == 15) {
                             toggleUhc(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 16) { // Whitelist Buch
+                        } else if (slotId == 16) {
                             openWhitelistMenu(sp);
-                        } else if (slotId == 22) { // Meldungen
+                        } else if (slotId == 22) {
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eChat-Meldungen §7» " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -677,7 +680,6 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -706,7 +708,7 @@ public class ExampleMod implements ModInitializer {
         }
         container.setItem(4, ctrlItem);
 
-        // --- LINKE SEITE: WELT-SYSTEME ---
+        // Linke Seite: Welt-Systeme
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
         waterItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -735,7 +737,7 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(12, obsItem);
 
-        // --- MITTE: BLOCK-DESPAWN SCHALTER (SLOT 13) ---
+        // Mitte: Block-Despawn Schalter (Slot 13)
         ItemStack deleteItem = new ItemStack(blockDeleteEnabled ? Blocks.TNT.asItem() : Blocks.BARRIER.asItem());
         deleteItem.set(DataComponents.CUSTOM_NAME, Component.literal(blockDeleteEnabled ? "§c§lBlock-Despawn: AN" : "§7§lBlock-Despawn: AUS"));
         deleteItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -746,7 +748,7 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(13, deleteItem);
 
-        // --- RECHTE SEITE: MODIFIER ---
+        // Rechte Seite: Modifier
         ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
         heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen: AN" : "§7§lGeteilte Herzen: AUS"));
         heartsItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -774,7 +776,7 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(16, bookItem);
 
-        // Slot 22: Meldungen
+        // Unten Mitte: Meldungen
         ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
