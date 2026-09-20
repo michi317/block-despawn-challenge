@@ -57,6 +57,7 @@ public class ExampleMod implements ModInitializer {
     private static int actionbarTicks = 0;
 
     // Modifier
+    public static boolean blockDeleteEnabled = true; // NEU: Block-Löschen als Modifier ein-/ausschaltbar
     public static boolean sharedHearts = false;
     public static float currentSharedHealth = 20.0f;
     private static boolean syncingHealth = false;
@@ -67,13 +68,10 @@ public class ExampleMod implements ModInitializer {
     // Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
-    private static final Map<UUID, ChunkPos> LAST_PLAYER_CHUNK = new HashMap<>();
 
-    // Kontinuierliche Chunk-Bereinigung
-    private static final Set<Long> PURGED_CHUNKS = new HashSet<>();
-    private static final Set<Long> IN_QUEUE = new HashSet<>();
-    private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
-    private static ServerLevel purgeLevel = null;
+    // Multi-Player Live Radar Tracking
+    private static int banVersion = 0;
+    private static final Map<String, Map<Long, Integer>> WORLD_CLEANED_CHUNKS = new HashMap<>();
 
     // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
@@ -86,7 +84,7 @@ public class ExampleMod implements ModInitializer {
 
     private static final Random RANDOM = new Random();
 
-    // Versions- und mapping-unabhängiger 64-Bit Chunk-Key
+    // Mapping-unabhängiger 64-Bit Chunk-Key
     public static long chunkKey(int x, int z) {
         return (((long) x) & 0xFFFFFFFFL) | ((((long) z) & 0xFFFFFFFFL) << 32);
     }
@@ -109,17 +107,14 @@ public class ExampleMod implements ModInitializer {
         actionbarTicks = 0;
         currentSharedHealth = 20.0f;
         syncingHealth = false;
+        blockDeleteEnabled = true;
         waterAllowed = true;
         lavaAllowed = true;
+        banVersion++;
 
         PLAYER_CURRENT_BLOCKS.clear();
         LAST_HEALTH_MAP.clear();
-        LAST_PLAYER_CHUNK.clear();
-
-        PURGED_CHUNKS.clear();
-        IN_QUEUE.clear();
-        PURGE_QUEUE.clear();
-        purgeLevel = null;
+        WORLD_CLEANED_CHUNKS.clear();
         HOSTS.clear();
 
         WHITELIST.clear();
@@ -216,7 +211,7 @@ public class ExampleMod implements ModInitializer {
                         return 0;
                     }
                     resetChallengeState();
-                    context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§aChallenge wurde vollständig zurückgesetzt! Alle verbannten Blöcke wurden gelöscht.")), true);
+                    context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§aChallenge wurde vollständig zurückgesetzt!")), true);
                     return 1;
                 }))
                 .then(Commands.literal("whitelist").executes(context -> {
@@ -236,6 +231,7 @@ public class ExampleMod implements ModInitializer {
                         } else {
                             WHITELIST.add(b);
                             BANNED_BLOCKS.remove(b);
+                            banVersion++;
                             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + b.getName().getString() + " §7zur Whitelist hinzugefügt!")));
                         }
                     } else {
@@ -265,8 +261,10 @@ public class ExampleMod implements ModInitializer {
             return true;
         });
 
-        // 2. Platzieren verbotener Blöcke verbrennen
+        // 2. Platzieren verbotener Blöcke verbrennen (nur aktiv wenn Block-Despawn an ist)
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
+            if (!blockDeleteEnabled) return InteractionResult.PASS;
+
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
                 if (BANNED_BLOCKS.contains(blockItem.getBlock())) {
@@ -326,85 +324,69 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Live-Radar für alle Spieler
-            if (!BANNED_BLOCKS.isEmpty()) {
-                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                    ChunkPos currentChunk = player.chunkPosition();
-                    ChunkPos lastChunk = LAST_PLAYER_CHUNK.put(player.getUUID(), currentChunk);
+            // --- MULTI-PLAYER LIVE RADAR (Für alle 5 Spieler gleichzeitig) ---
+            if (blockDeleteEnabled && !BANNED_BLOCKS.isEmpty()) {
+                List<ServerPlayer> players = server.getPlayerList().getPlayers();
+                if (!players.isEmpty()) {
+                    long deadline = System.currentTimeMillis() + 4; // Strenges 4ms Budget pro Tick
 
-                    if (lastChunk == null || !lastChunk.equals(currentChunk)) {
-                        if (player.level() instanceof ServerLevel sl) {
-                            queueChunksAroundPlayer(sl, currentChunk, 24);
+                    // Prüft Ringe 0 bis 22 um jeden einzelnen Spieler gleichberechtigt
+                    for (int r = 0; r <= 22 && System.currentTimeMillis() < deadline; r++) {
+                        for (ServerPlayer player : players) {
+                            if (System.currentTimeMillis() >= deadline) break;
+                            if (player.level() instanceof ServerLevel sl) {
+                                int px = player.chunkPosition().x;
+                                int pz = player.chunkPosition().z;
+                                cleanRingForPlayer(sl, px, pz, r);
+                            }
                         }
-                    }
-                }
-
-                if (server.getTickCount() % 20 == 0) {
-                    for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                        if (player.level() instanceof ServerLevel sl) {
-                            queueChunksAroundPlayer(sl, player.chunkPosition(), 24);
-                        }
-                    }
-                }
-            }
-
-            // Queue-Verarbeitung mit 3ms Zeitbudget
-            if (!PURGE_QUEUE.isEmpty() && purgeLevel != null) {
-                long deadline = System.currentTimeMillis() + 3;
-                while (!PURGE_QUEUE.isEmpty() && System.currentTimeMillis() < deadline) {
-                    ChunkPos cp = PURGE_QUEUE.poll();
-                    long key = chunkKey(cp.x(), cp.z());
-                    IN_QUEUE.remove(key);
-
-                    LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
-                    if (chunk != null) {
-                        clearChunkDirect(purgeLevel, chunk);
-                        PURGED_CHUNKS.add(key);
                     }
                 }
             }
 
             if (!isRunning || isPaused) return;
 
-            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                if (player.onGround()) {
-                    Block currentBlock = getBlockUnderPlayer(player);
+            // Blockwechsel-Logik (nur aktiv wenn Block-Despawn an ist)
+            if (blockDeleteEnabled) {
+                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                    if (player.onGround()) {
+                        Block currentBlock = getBlockUnderPlayer(player);
 
-                    if (currentBlock != null && !WHITELIST.contains(currentBlock)) {
-                        Block lastBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
+                        if (currentBlock != null && !WHITELIST.contains(currentBlock)) {
+                            Block lastBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
 
-                        if (lastBlock == null) {
-                            PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
-                        } else if (!currentBlock.equals(lastBlock)) {
-                            if (!WHITELIST.contains(lastBlock) && !BANNED_BLOCKS.contains(lastBlock)) {
-                                BANNED_BLOCKS.add(lastBlock);
+                            if (lastBlock == null) {
+                                PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
+                            } else if (!currentBlock.equals(lastBlock)) {
+                                if (!WHITELIST.contains(lastBlock) && !BANNED_BLOCKS.contains(lastBlock)) {
+                                    BANNED_BLOCKS.add(lastBlock);
+                                    banVersion++; // Löst bei allen 5 Spielern sofortige Neubereinigung aus
 
-                                if (showBroadcasts) {
-                                    server.getPlayerList().broadcastSystemMessage(
-                                        Component.empty().append(PREFIX)
-                                            .append(Component.literal("§f" + player.getName().getString() + " §7hat §a" + currentBlock.getName().getString()))
-                                            .append(Component.literal(" §7betreten §8— §c" + lastBlock.getName().getString() + " §7wurde verbannt!")),
-                                        false
-                                    );
-                                }
+                                    if (showBroadcasts) {
+                                        server.getPlayerList().broadcastSystemMessage(
+                                            Component.empty().append(PREFIX)
+                                                .append(Component.literal("§f" + player.getName().getString() + " §7hat §a" + currentBlock.getName().getString()))
+                                                .append(Component.literal(" §7betreten §8— §c" + lastBlock.getName().getString() + " §7wurde verbannt!")),
+                                            false
+                                        );
+                                    }
 
-                                if (player.level() instanceof ServerLevel serverLevel) {
-                                    BlockPos pPos = player.blockPosition();
-                                    for (int dx = -5; dx <= 5; dx++) {
-                                        for (int dy = -3; dy <= 3; dy++) {
-                                            for (int dz = -5; dz <= 5; dz++) {
-                                                BlockPos nearPos = pPos.offset(dx, dy, dz);
-                                                if (lastBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
-                                                    serverLevel.levelEvent(2001, nearPos, Block.getId(lastBlock.defaultBlockState()));
+                                    if (player.level() instanceof ServerLevel serverLevel) {
+                                        BlockPos pPos = player.blockPosition();
+                                        for (int dx = -5; dx <= 5; dx++) {
+                                            for (int dy = -3; dy <= 3; dy++) {
+                                                for (int dz = -5; dz <= 5; dz++) {
+                                                    BlockPos nearPos = pPos.offset(dx, dy, dz);
+                                                    if (lastBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
+                                                        serverLevel.levelEvent(2001, nearPos, Block.getId(lastBlock.defaultBlockState()));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-
-                                    triggerPurgeForNewBan(serverLevel);
                                 }
+                                PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
                             }
-                            PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
                         }
                     }
                 }
@@ -412,49 +394,36 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    private static void triggerPurgeForNewBan(ServerLevel serverLevel) {
-        PURGED_CHUNKS.clear();
-        IN_QUEUE.clear();
-        PURGE_QUEUE.clear();
+    // Reinigt ringförmig um die Position eines Spielers
+    private static void cleanRingForPlayer(ServerLevel level, int px, int pz, int r) {
+        String worldKey = level.dimension().location().toString();
+        Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
 
-        for (ServerPlayer p : serverLevel.players()) {
-            LevelChunk c = serverLevel.getChunkSource().getChunk(p.chunkPosition().x(), p.chunkPosition().z(), false);
-            if (c != null) {
-                clearChunkDirect(serverLevel, c);
-                PURGED_CHUNKS.add(chunkKey(p.chunkPosition().x(), p.chunkPosition().z()));
-            }
+        if (r == 0) {
+            cleanChunkIfDue(level, px, pz, cleanedMap);
+            return;
         }
 
-        for (ServerPlayer p : serverLevel.players()) {
-            queueChunksAroundPlayer(serverLevel, p.chunkPosition(), 24);
+        for (int i = -r; i <= r; i++) {
+            cleanChunkIfDue(level, px + i, pz - r, cleanedMap);
+            cleanChunkIfDue(level, px + i, pz + r, cleanedMap);
+        }
+        for (int i = -r + 1; i <= r - 1; i++) {
+            cleanChunkIfDue(level, px - r, pz + i, cleanedMap);
+            cleanChunkIfDue(level, px + r, pz + i, cleanedMap);
         }
     }
 
-    private static void queueChunksAroundPlayer(ServerLevel level, ChunkPos center, int radius) {
-        if (BANNED_BLOCKS.isEmpty()) return;
-        purgeLevel = level;
-
-        List<ChunkPos> newChunks = new ArrayList<>();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                if (dx * dx + dz * dz <= radius * radius) {
-                    int cx = center.x() + dx;
-                    int cz = center.z() + dz;
-                    long key = chunkKey(cx, cz);
-                    if (!PURGED_CHUNKS.contains(key) && IN_QUEUE.add(key)) {
-                        newChunks.add(new ChunkPos(cx, cz));
-                    }
-                }
-            }
+    private static void cleanChunkIfDue(ServerLevel level, int cx, int cz, Map<Long, Integer> cleanedMap) {
+        long key = chunkKey(cx, cz);
+        if (cleanedMap.getOrDefault(key, -1) == banVersion) {
+            return; // Bereits sauber
         }
-
-        newChunks.sort(Comparator.comparingInt(cp -> {
-            int ox = cp.x() - center.x();
-            int oz = cp.z() - center.z();
-            return ox * ox + oz * oz;
-        }));
-
-        PURGE_QUEUE.addAll(newChunks);
+        LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, false);
+        if (chunk != null) {
+            clearChunkDirect(level, chunk);
+            cleanedMap.put(key, banVersion);
+        }
     }
 
     private static Block getBlockUnderPlayer(ServerPlayer player) {
@@ -589,23 +558,35 @@ public class ExampleMod implements ModInitializer {
         isRunning = true;
         isPaused = false;
 
-        Block hostBlock = getBlockUnderPlayer(host);
-        if (hostBlock == null || WHITELIST.contains(hostBlock)) {
-            hostBlock = Blocks.GRASS_BLOCK;
+        if (blockDeleteEnabled) {
+            Block hostBlock = getBlockUnderPlayer(host);
+            if (hostBlock == null || WHITELIST.contains(hostBlock)) {
+                hostBlock = Blocks.GRASS_BLOCK;
+            }
+
+            PLAYER_CURRENT_BLOCKS.clear();
+            for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                PLAYER_CURRENT_BLOCKS.put(p.getUUID(), hostBlock);
+                LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+            }
+
+            currentSharedHealth = host.getHealth();
+
+            server.getPlayerList().broadcastSystemMessage(
+                Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7Startblock: §f§l" + hostBlock.getName().getString())),
+                false
+            );
+        } else {
+            for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+                LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+            }
+            currentSharedHealth = host.getHealth();
+
+            server.getPlayerList().broadcastSystemMessage(
+                Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7(Modifier-Modus ohne Block-Despawn)")),
+                false
+            );
         }
-
-        PLAYER_CURRENT_BLOCKS.clear();
-        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-            PLAYER_CURRENT_BLOCKS.put(p.getUUID(), hostBlock);
-            LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
-        }
-
-        currentSharedHealth = host.getHealth();
-
-        server.getPlayerList().broadcastSystemMessage(
-            Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7Startblock: §f§l" + hostBlock.getName().getString())),
-            false
-        );
     }
 
     private static void updateActionBar(net.minecraft.server.MinecraftServer server) {
@@ -621,9 +602,13 @@ public class ExampleMod implements ModInitializer {
             } else if (isPaused) {
                 actionText = Component.literal("§7§oTimer pausiert §8(§e" + timeStr + "§8)");
             } else {
-                Block myBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
-                String bName = (myBlock != null) ? myBlock.getName().getString() : "Warten...";
-                actionText = Component.literal("§e§l" + timeStr + " §8| §7Block: §a§l" + bName);
+                if (blockDeleteEnabled) {
+                    Block myBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
+                    String bName = (myBlock != null) ? myBlock.getName().getString() : "Warten...";
+                    actionText = Component.literal("§e§l" + timeStr + " §8| §7Block: §a§l" + bName);
+                } else {
+                    actionText = Component.literal("§e§l" + timeStr + " §8| §c§lKein Block-Despawn");
+                }
             }
 
             if (player.connection != null) {
@@ -632,6 +617,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Menü-Layout: Links Welt (10, 11, 12) | Mitte Schalter (13) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -665,6 +651,10 @@ public class ExampleMod implements ModInitializer {
                         } else if (slotId == 12) { // Obsidian
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
+                        } else if (slotId == 13) { // NEU: Block-Despawn Modifier Toggle
+                            blockDeleteEnabled = !blockDeleteEnabled;
+                            sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eBlock-Despawn §7» " + (blockDeleteEnabled ? "§aAktiviert" : "§cDeaktiviert"))));
+                            updateMenuIcons(container);
                         } else if (slotId == 14) { // Geteilte Herzen
                             toggleSharedHearts(sl.getServer(), sp);
                             updateMenuIcons(container);
@@ -693,7 +683,7 @@ public class ExampleMod implements ModInitializer {
             ctrlItem = new ItemStack(Items.CLOCK);
             ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§a§lChallenge starten"));
             ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
-                Component.literal("§7Startet mit dem Block unter dem Host"),
+                Component.literal("§7Startet Timer und Systeme"),
                 Component.literal(""),
                 Component.literal("§8» §eKlick: Challenge starten!")
             )));
@@ -744,6 +734,17 @@ public class ExampleMod implements ModInitializer {
             Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren"))
         )));
         container.setItem(12, obsItem);
+
+        // --- MITTE: BLOCK-DESPAWN SCHALTER (SLOT 13) ---
+        ItemStack deleteItem = new ItemStack(blockDeleteEnabled ? Blocks.TNT.asItem() : Blocks.BARRIER.asItem());
+        deleteItem.set(DataComponents.CUSTOM_NAME, Component.literal(blockDeleteEnabled ? "§c§lBlock-Despawn: AN" : "§7§lBlock-Despawn: AUS"));
+        deleteItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (blockDeleteEnabled ? "§aAktiviert" : "§cDeaktiviert")),
+            Component.literal(""),
+            Component.literal("§8» §7Bestimmt, ob Blöcke beim Laufen gelöscht werden."),
+            Component.literal("§8» §eKlick: " + (blockDeleteEnabled ? "§cDeaktivieren (Nur Herzen/UHC spielen)" : "§aAktivieren"))
+        )));
+        container.setItem(13, deleteItem);
 
         // --- RECHTE SEITE: MODIFIER ---
         ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
@@ -846,6 +847,7 @@ public class ExampleMod implements ModInitializer {
                         if (slotId < list.size()) {
                             Block removeBlock = list.get(slotId);
                             WHITELIST.remove(removeBlock);
+                            banVersion++;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + removeBlock.getName().getString() + " §7von der Whitelist entfernt!")));
                             openWhitelistMenu(sp);
                         }
@@ -861,10 +863,11 @@ public class ExampleMod implements ModInitializer {
         waterAllowed = !waterAllowed;
         if (!waterAllowed) {
             BANNED_BLOCKS.add(Blocks.WATER);
-            triggerPurgeForNewBan(level);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.WATER);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §aWieder erlaubt!")));
         }
     }
@@ -873,10 +876,11 @@ public class ExampleMod implements ModInitializer {
         lavaAllowed = !lavaAllowed;
         if (!lavaAllowed) {
             BANNED_BLOCKS.add(Blocks.LAVA);
-            triggerPurgeForNewBan(level);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.LAVA);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §aWieder erlaubt!")));
         }
     }
@@ -884,10 +888,12 @@ public class ExampleMod implements ModInitializer {
     private static void toggleBlockWhitelist(Block block, ServerPlayer player) {
         if (WHITELIST.contains(block)) {
             WHITELIST.remove(block);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + block.getName().getString() + " §7» §cSchutz aufgehoben")));
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
+            banVersion++;
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + block.getName().getString() + " §7» §aGeschützt")));
         }
     }
