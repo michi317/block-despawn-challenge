@@ -49,16 +49,18 @@ public class ExampleMod implements ModInitializer {
     private static int timerTicks = 0;
     private static int actionbarTicks = 0;
 
-    // Challenge-Modi: Geteilte Herzen & UHC
+    // Modifier
     public static boolean sharedHearts = false;
     public static float currentSharedHealth = 20.0f;
     private static boolean syncingHealth = false;
     public static boolean uhcMode = false;
+    public static boolean waterAllowed = true;
+    public static boolean lavaAllowed = true;
 
     // Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
 
-    // Schnelle Schockwellen-Queue
+    // Schnelle Schockwelle
     private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
     private static Block purgeTargetBlock = null;
     private static ServerLevel purgeLevel = null;
@@ -66,14 +68,9 @@ public class ExampleMod implements ModInitializer {
     // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
 
-    // Whitelist
+    // Reines Block-Whitelist-System (nur solide Blöcke, standardmäßig Obsidian)
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
-        Blocks.OBSIDIAN,
-        Blocks.AIR,
-        Blocks.CAVE_AIR,
-        Blocks.VOID_AIR,
-        Blocks.WATER,
-        Blocks.LAVA
+        Blocks.OBSIDIAN
     ));
 
     private static final Random RANDOM = new Random();
@@ -124,8 +121,6 @@ public class ExampleMod implements ModInitializer {
                         var src = context.getSource();
                         src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Status: " + (isRunning ? (isPaused ? "§ePausiert" : "§aLäuft") : "§cNicht aktiv"))), false);
                         src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Verbannte Blöcke: §c" + BANNED_BLOCKS.size())), false);
-                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Geteilte Herzen: " + (sharedHearts ? "§aAktiviert" : "§cDeaktiviert"))), false);
-                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7UHC-Modus: " + (uhcMode ? "§aAktiviert" : "§cDeaktiviert"))), false);
                     }
                     return 1;
                 })
@@ -133,34 +128,10 @@ public class ExampleMod implements ModInitializer {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
                     if (!isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf das Menü öffnen!")));
                         return 0;
                     }
                     openChallengeMenu(player);
-                    return 1;
-                }))
-                .then(Commands.literal("start").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
-                        return 0;
-                    }
-                    if (player != null) {
-                        startChallengeWithHost(player, context.getSource().getServer());
-                    }
-                    return 1;
-                }))
-                .then(Commands.literal("pause").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
-                        return 0;
-                    }
-                    if (isRunning) {
-                        isPaused = !isPaused;
-                        String status = isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!";
-                        context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal(status)), false);
-                    }
                     return 1;
                 }))
                 .then(Commands.literal("whitelist").executes(context -> {
@@ -190,7 +161,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Ghost-Item freies Platzieren verhinderter Blöcke
+        // 1. Ghost-Item freies Platzieren (sofortiges Verbrennen)
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -198,22 +169,25 @@ public class ExampleMod implements ModInitializer {
                     if (level instanceof ServerLevel serverLevel) {
                         BlockPos targetPos = hitResult.getBlockPos().relative(hitResult.getDirection());
 
-                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.9f, 1.1f);
+                        // Verbrenn-Effekte & Zischen
+                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.9f, 1.2f);
+                        serverLevel.playSound(null, targetPos, SoundEvents.FIRECHARGE_USE, SoundSource.BLOCKS, 0.4f, 1.1f);
                         serverLevel.sendParticles(ParticleTypes.LAVA, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 6, 0.2, 0.2, 0.2, 0.05);
-                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 14, 0.25, 0.25, 0.25, 0.05);
+                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 18, 0.25, 0.25, 0.25, 0.05);
                         serverLevel.sendParticles(ParticleTypes.SMOKE, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 10, 0.2, 0.2, 0.2, 0.02);
 
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + blockItem.getBlock().getName().getString() + " §7ist verbannt!")));
-                    }
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + blockItem.getBlock().getName().getString() + " §cist verbrannt!")));
 
-                    if (!player.isCreative()) {
-                        stack.shrink(1);
-                        if (player instanceof ServerPlayer sp) {
-                            sp.containerMenu.broadcastChanges();
-                            sp.inventoryMenu.broadcastChanges();
+                        if (!player.isCreative()) {
+                            stack.shrink(1);
+                            if (player instanceof ServerPlayer sp) {
+                                sp.containerMenu.sendAllDataToRemote();
+                                sp.inventoryMenu.sendAllDataToRemote();
+                            }
                         }
                     }
-                    return InteractionResult.FAIL;
+                    // SUCCESS signalisiert dem Client eine verbrauchte Aktion ohne Ghost-Block
+                    return InteractionResult.SUCCESS;
                 }
             }
             return InteractionResult.PASS;
@@ -232,7 +206,6 @@ public class ExampleMod implements ModInitializer {
                     timerSeconds++;
                 }
 
-                // Geteilte Herzen synchronisieren
                 if (sharedHearts && !syncingHealth) {
                     handleSharedHearts(server);
                 }
@@ -244,7 +217,7 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Schnelle Schockwellen-Verarbeitung
+            // Schnelle 16-Chunks/Tick Schockwelle
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
                 for (int i = 0; i < 16 && !PURGE_QUEUE.isEmpty(); i++) {
                     ChunkPos cp = PURGE_QUEUE.poll();
@@ -374,10 +347,10 @@ public class ExampleMod implements ModInitializer {
     private static Block getBlockUnderPlayer(ServerPlayer player) {
         BlockPos pPos = player.blockPosition();
         BlockState state = player.level().getBlockState(pPos.below());
-        if (!state.isAir()) return state.getBlock();
+        if (!state.isAir() && !state.is(Blocks.WATER) && !state.is(Blocks.LAVA)) return state.getBlock();
 
         BlockState deep = player.level().getBlockState(pPos.below(2));
-        if (!deep.isAir()) return deep.getBlock();
+        if (!deep.isAir() && !deep.is(Blocks.WATER) && !deep.is(Blocks.LAVA)) return deep.getBlock();
 
         return null;
     }
@@ -429,6 +402,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Sauberes Menü: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -453,24 +427,24 @@ public class ExampleMod implements ModInitializer {
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 10) {
+                        } else if (slotId == 10) { // Wasser (Links)
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 11) {
-                            toggleSharedHearts(sl.getServer(), sp);
-                            updateMenuIcons(container);
-                        } else if (slotId == 12) {
+                        } else if (slotId == 11) { // Lava (Links)
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) {
-                            toggleUhc(sl, sp);
-                            updateMenuIcons(container);
-                        } else if (slotId == 14) {
+                        } else if (slotId == 12) { // Obsidian (Links)
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 16) {
+                        } else if (slotId == 14) { // Geteilte Herzen (Rechts)
+                            toggleSharedHearts(sl.getServer(), sp);
+                            updateMenuIcons(container);
+                        } else if (slotId == 15) { // UHC (Rechts)
+                            toggleUhc(sl, sp);
+                            updateMenuIcons(container);
+                        } else if (slotId == 16) { // Whitelist Buch (Rechts)
                             openWhitelistMenu(sp);
-                        } else if (slotId == 22) {
+                        } else if (slotId == 22) { // Meldungen (Unten Mitte)
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -484,6 +458,7 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
+        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -512,47 +487,28 @@ public class ExampleMod implements ModInitializer {
         }
         container.setItem(4, ctrlItem);
 
-        boolean waterOk = WHITELIST.contains(Blocks.WATER);
+        // --- LINKE SEITE: WELT-SYSTEME ---
+        // Slot 10: Wasser
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
         waterItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt")),
+            Component.literal("§7Status: " + (waterAllowed ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn allen Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (waterAllowed ? "§cIn allen Chunks löschen & verbannen" : "§aWieder erlauben"))
         )));
         container.setItem(10, waterItem);
 
-        ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
-        heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen: AN" : "§7§lGeteilte Herzen: AUS"));
-        heartsItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (sharedHearts ? "§aAktiviert" : "§cDeaktiviert")),
-            Component.literal(""),
-            Component.literal("§8» §7Nimmt ein Spieler Schaden, verlieren alle dieselben Herzen."),
-            Component.literal("§8» §eKlick: " + (sharedHearts ? "§cDeaktivieren" : "§aAktivieren"))
-        )));
-        container.setItem(11, heartsItem);
-
-        boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
+        // Slot 11: Lava
         ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
         lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
         lavaItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt")),
+            Component.literal("§7Status: " + (lavaAllowed ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn allen Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (lavaAllowed ? "§cIn allen Chunks löschen & verbannen" : "§aWieder erlauben"))
         )));
-        container.setItem(12, lavaItem);
+        container.setItem(11, lavaItem);
 
-        ItemStack uhcItem = new ItemStack(Items.GOLDEN_CARROT);
-        uhcItem.set(DataComponents.CUSTOM_NAME, Component.literal(uhcMode ? "§6§lUltra Hardcore (UHC): AN" : "§7§lUltra Hardcore (UHC): AUS"));
-        uhcItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (uhcMode ? "§aAktiviert" : "§cDeaktiviert")),
-            Component.literal(""),
-            Component.literal("§8» §7Keine natürliche Lebensregeneration durch Essen."),
-            Component.literal("§8» §7Heilung nur über Tränke, Goldäpfel etc."),
-            Component.literal("§8» §eKlick: " + (uhcMode ? "§cDeaktivieren" : "§aAktivieren"))
-        )));
-        container.setItem(13, uhcItem);
-
+        // Slot 12: Obsidian
         boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
         ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
         obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
@@ -561,17 +517,42 @@ public class ExampleMod implements ModInitializer {
             Component.literal(""),
             Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren"))
         )));
-        container.setItem(14, obsItem);
+        container.setItem(12, obsItem);
 
+        // --- RECHTE SEITE: MODIFIER & WHITELIST ---
+        // Slot 14: Geteilte Herzen
+        ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
+        heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen: AN" : "§7§lGeteilte Herzen: AUS"));
+        heartsItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (sharedHearts ? "§aAktiviert" : "§cDeaktiviert")),
+            Component.literal(""),
+            Component.literal("§8» §7Schaden und Heilung werden synchronisiert."),
+            Component.literal("§8» §eKlick: " + (sharedHearts ? "§cDeaktivieren" : "§aAktivieren"))
+        )));
+        container.setItem(14, heartsItem);
+
+        // Slot 15: UHC
+        ItemStack uhcItem = new ItemStack(Items.GOLDEN_CARROT);
+        uhcItem.set(DataComponents.CUSTOM_NAME, Component.literal(uhcMode ? "§6§lUltra Hardcore (UHC): AN" : "§7§lUltra Hardcore (UHC): AUS"));
+        uhcItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (uhcMode ? "§aAktiviert" : "§cDeaktiviert")),
+            Component.literal(""),
+            Component.literal("§8» §7Keine natürliche Lebensregeneration durch Essen."),
+            Component.literal("§8» §eKlick: " + (uhcMode ? "§cDeaktivieren" : "§aAktivieren"))
+        )));
+        container.setItem(15, uhcItem);
+
+        // Slot 16: Whitelist Buch
         ItemStack bookItem = new ItemStack(Items.BOOK);
         bookItem.set(DataComponents.CUSTOM_NAME, Component.literal("§d§lWhitelist Übersicht"));
         bookItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Aktuell geschützt: §e" + WHITELIST.size() + " Blöcke"),
+            Component.literal("§7Geschützt: §e" + WHITELIST.size() + " Blöcke"),
             Component.literal(""),
-            Component.literal("§8» §eKlick: Blöcke ansehen & per Klick entfernen")
+            Component.literal("§8» §eKlick: Liste öffnen & per Klick entfernen")
         )));
         container.setItem(16, bookItem);
 
+        // Slot 22: Meldungen
         ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -592,12 +573,12 @@ public class ExampleMod implements ModInitializer {
             }
             syncingHealth = false;
             server.getPlayerList().broadcastSystemMessage(
-                Component.empty().append(PREFIX).append(Component.literal("§c§lGeteilte Herzen: §aAktiviert §8(Alle teilen dieselben Herzen!)")),
+                Component.empty().append(PREFIX).append(Component.literal("§cGeteilte Herzen §8» §aAktiviert §7(Schaden wird synchronisiert)")),
                 false
             );
         } else {
             server.getPlayerList().broadcastSystemMessage(
-                Component.empty().append(PREFIX).append(Component.literal("§c§lGeteilte Herzen: §cDeaktiviert")),
+                Component.empty().append(PREFIX).append(Component.literal("§cGeteilte Herzen §8» §cDeaktiviert")),
                 false
             );
         }
@@ -608,8 +589,8 @@ public class ExampleMod implements ModInitializer {
         var server = level.getServer();
         server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule naturalRegeneration " + (!uhcMode));
         server.getPlayerList().broadcastSystemMessage(
-            Component.empty().append(PREFIX).append(Component.literal("§6§lUltra Hardcore (UHC): " + 
-                (uhcMode ? "§aAktiviert §8(Keine natürliche Regeneration!)" : "§cDeaktiviert"))),
+            Component.empty().append(PREFIX).append(Component.literal("§6Ultra Hardcore (UHC) §8» " + 
+                (uhcMode ? "§aAktiviert §7(Keine Essens-Regeneration)" : "§cDeaktiviert"))),
             false
         );
     }
@@ -617,10 +598,7 @@ public class ExampleMod implements ModInitializer {
     private static void openWhitelistMenu(ServerPlayer player) {
         player.openMenu(new SimpleMenuProvider((syncId, playerInv, p) -> {
             SimpleContainer container = new SimpleContainer(27);
-            List<Block> list = new ArrayList<>();
-            for (Block b : WHITELIST) {
-                if (b.asItem() != Items.AIR) list.add(b);
-            }
+            List<Block> list = new ArrayList<>(WHITELIST);
 
             for (int i = 0; i < Math.min(list.size(), 26); i++) {
                 Block b = list.get(i);
@@ -665,39 +643,37 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void toggleWater(ServerLevel level, ServerPlayer player) {
-        if (WHITELIST.contains(Blocks.WATER)) {
-            WHITELIST.remove(Blocks.WATER);
+        waterAllowed = !waterAllowed;
+        if (!waterAllowed) {
             BANNED_BLOCKS.add(Blocks.WATER);
             startFastRadialPurge(level, player.chunkPosition(), Blocks.WATER, 16);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt — Despawn-Welle gestartet!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§bWasser-System §8» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
-            WHITELIST.add(Blocks.WATER);
             BANNED_BLOCKS.remove(Blocks.WATER);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aWasser ist wieder auf der Whitelist!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§bWasser-System §8» §aWieder erlaubt!")));
         }
     }
 
     private static void toggleLava(ServerLevel level, ServerPlayer player) {
-        if (WHITELIST.contains(Blocks.LAVA)) {
-            WHITELIST.remove(Blocks.LAVA);
+        lavaAllowed = !lavaAllowed;
+        if (!lavaAllowed) {
             BANNED_BLOCKS.add(Blocks.LAVA);
             startFastRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 16);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt — Despawn-Welle gestartet!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§6Lava-System §8» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
-            WHITELIST.add(Blocks.LAVA);
             BANNED_BLOCKS.remove(Blocks.LAVA);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aLava ist wieder auf der Whitelist!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§6Lava-System §8» §aWieder erlaubt!")));
         }
     }
 
     private static void toggleBlockWhitelist(Block block, ServerPlayer player) {
         if (WHITELIST.contains(block)) {
             WHITELIST.remove(block);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + block.getName().getString() + " ist nicht mehr geschützt!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§5Obsidian-Schutz §8» §cDeaktiviert")));
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + block.getName().getString() + " ist nun geschützt!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§5Obsidian-Schutz §8» §aAktiviert")));
         }
     }
 
