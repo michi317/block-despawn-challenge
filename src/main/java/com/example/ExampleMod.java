@@ -50,11 +50,15 @@ public class ExampleMod implements ModInitializer {
     private static int timerTicks = 0;
     private static int actionbarTicks = 0;
 
-    // Host-System: Speichert die UUID des Welt-Erstellers
+    // Performance Wave Queue
+    private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
+    private static Block purgeTargetBlock = null;
+    private static ServerLevel purgeLevel = null;
+
+    // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
 
-    private static final Map<UUID, ChunkPos> LAST_CHUNKS = new HashMap<>();
-
+    // Veränderbare Whitelist
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
         Blocks.OBSIDIAN,
         Blocks.AIR,
@@ -66,7 +70,6 @@ public class ExampleMod implements ModInitializer {
 
     private static final Random RANDOM = new Random();
 
-    // Prüft, ob der Spieler der Host der Welt ist
     public static boolean isHost(ServerPlayer player) {
         if (HOSTS.isEmpty()) {
             HOSTS.add(player.getUUID());
@@ -75,7 +78,7 @@ public class ExampleMod implements ModInitializer {
         return HOSTS.contains(player.getUUID());
     }
 
-    // Farbverlauf für Challenge-Präfix (#FF3838 -> #FFA800)
+    // Hex-Farbverlauf (#FF3838 -> #FFA800)
     public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
         MutableComponent comp = Component.empty();
         int len = text.length();
@@ -106,7 +109,6 @@ public class ExampleMod implements ModInitializer {
     public void onInitialize() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
-                // /challenge (Host öffnet Menü, Mitspieler sehen Info)
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player != null && isHost(player)) {
@@ -120,7 +122,6 @@ public class ExampleMod implements ModInitializer {
                     }
                     return 1;
                 })
-                // /challenge menu (Nur Host)
                 .then(Commands.literal("menu").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
@@ -131,33 +132,6 @@ public class ExampleMod implements ModInitializer {
                     openChallengeMenu(player);
                     return 1;
                 }))
-                // /challenge start (Nur Host)
-                .then(Commands.literal("start").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
-                        return 0;
-                    }
-                    isRunning = true;
-                    isPaused = false;
-                    context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet!")), false);
-                    return 1;
-                }))
-                // /challenge pause (Nur Host)
-                .then(Commands.literal("pause").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
-                        return 0;
-                    }
-                    if (isRunning) {
-                        isPaused = !isPaused;
-                        String status = isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!";
-                        context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal(status)), false);
-                    }
-                    return 1;
-                }))
-                // /challenge whitelist (Nur Host)
                 .then(Commands.literal("whitelist").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
@@ -188,7 +162,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Verhindern, dass verbannte Blöcke platziert werden
+        // Verhindern, dass verbotene Blöcke platziert werden
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -208,9 +182,8 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 2. Server-Tick
+        // Haupt Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
-            // Host beim Betreten automatisch registrieren
             if (HOSTS.isEmpty() && !server.getPlayerList().getPlayers().isEmpty()) {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
@@ -223,25 +196,27 @@ public class ExampleMod implements ModInitializer {
                 }
             }
 
+            // Actionbar alle 5 Ticks synchronisieren
             actionbarTicks++;
             if (actionbarTicks >= 5) {
                 actionbarTicks = 0;
                 updateActionBar(server);
             }
 
-            if (!isRunning || isPaused) {
-                return;
-            }
-
-            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                ChunkPos currentChunk = player.chunkPosition();
-                ChunkPos lastChunk = LAST_CHUNKS.put(player.getUUID(), currentChunk);
-                if (lastChunk != null && !lastChunk.equals(currentChunk) && !BANNED_BLOCKS.isEmpty()) {
-                    if (player.level() instanceof ServerLevel sl) {
-                        purgeLocalChunks(sl, currentChunk, 3);
+            // Wave-Queue verarbeiten (4 Chunks pro Tick = 80 Chunks/Sekunde flüssig ohne Lag)
+            if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
+                for (int i = 0; i < 4 && !PURGE_QUEUE.isEmpty(); i++) {
+                    ChunkPos cp = PURGE_QUEUE.poll();
+                    LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
+                    if (chunk != null) {
+                        clearChunkDirect(purgeLevel, chunk, purgeTargetBlock);
                     }
                 }
+            }
 
+            if (!isRunning || isPaused) return;
+
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 if (player.onGround()) {
                     BlockPos underPos = new BlockPos(player.getBlockX(), player.getBlockY() - 1, player.getBlockZ());
                     BlockState underState = player.level().getBlockState(underPos);
@@ -262,16 +237,18 @@ public class ExampleMod implements ModInitializer {
                             if (!WHITELIST.contains(oldBlock) && !BANNED_BLOCKS.contains(oldBlock)) {
                                 BANNED_BLOCKS.add(oldBlock);
 
+                                // Klarer, zusammenhängender deutscher Satz
                                 if (showBroadcasts) {
                                     server.getPlayerList().broadcastSystemMessage(
                                         Component.empty().append(PREFIX)
-                                            .append(Component.literal("§f" + player.getName().getString() + " §8» §7Neuer Block: §a" + currentBlock.getName().getString()))
-                                            .append(Component.literal(" §8| §7Verbannt: §c" + oldBlock.getName().getString())),
+                                            .append(Component.literal("§f" + player.getName().getString() + " §7hat §a" + currentBlock.getName().getString()))
+                                            .append(Component.literal(" §7betreten §8— §c" + oldBlock.getName().getString() + " §7wurde verbannt!")),
                                         false
                                     );
                                 }
 
                                 if (player.level() instanceof ServerLevel serverLevel) {
+                                    // Nahbereichs-Partikel um den Spieler
                                     BlockPos pPos = player.blockPosition();
                                     for (int dx = -5; dx <= 5; dx++) {
                                         for (int dy = -3; dy <= 3; dy++) {
@@ -284,13 +261,9 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    purgeBlockFromLoadedChunks(serverLevel, oldBlock);
+                                    // Radiale Schockwelle starten (von innen nach außen)
+                                    startRadialPurge(serverLevel, player.chunkPosition(), oldBlock, 14);
                                 }
-                            } else if (showBroadcasts && WHITELIST.contains(oldBlock)) {
-                                server.getPlayerList().broadcastSystemMessage(
-                                    Component.empty().append(PREFIX).append(Component.literal("§f" + player.getName().getString() + " §8» §7Neuer Block: §a" + currentBlock.getName().getString())),
-                                    false
-                                );
                             }
                             currentSharedBlock = currentBlock;
                         }
@@ -300,6 +273,7 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
+    // Actionbar ohne "Challenge »"
     private static void updateActionBar(net.minecraft.server.MinecraftServer server) {
         Component actionText;
         int s = timerSeconds % 60;
@@ -308,15 +282,12 @@ public class ExampleMod implements ModInitializer {
         String timeStr = (h > 0) ? String.format("%02d:%02d:%02d", h, m, s) : String.format("%02d:%02d", m, s);
 
         if (!isRunning) {
-            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
-                    .append(Component.literal(" §8» §7§oNicht gestartet"));
+            actionText = Component.literal("§7§oChallenge nicht gestartet §8(/challenge)");
         } else if (isPaused) {
-            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
-                    .append(Component.literal(" §8» §7§oTimer pausiert §8(§e" + timeStr + "§8)"));
+            actionText = Component.literal("§7§oTimer pausiert §8(§e" + timeStr + "§8)");
         } else {
             String bName = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Warten...";
-            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
-                    .append(Component.literal(" §8» §e" + timeStr + " §8| §7Block: §a" + bName));
+            actionText = Component.literal("§e§l" + timeStr + " §8| §7Block: §a§l" + bName);
         }
 
         ClientboundSetActionBarTextPacket packet = new ClientboundSetActionBarTextPacket(actionText);
@@ -327,6 +298,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Hauptmenü
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -339,11 +311,11 @@ public class ExampleMod implements ModInitializer {
                 public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
                     if (slotId >= 0 && slotId < 27) {
                         ServerPlayer sp = (ServerPlayer) clicker;
-                        if (!isHost(sp)) return; // Klicks von Nicht-Hosts abfangen
+                        if (!isHost(sp)) return;
 
                         ServerLevel sl = (ServerLevel) sp.level();
 
-                        if (slotId == 4) {
+                        if (slotId == 4) { // Challenge Controller (Clock / Torch / Repeater)
                             if (!isRunning) {
                                 isRunning = true;
                                 isPaused = false;
@@ -353,16 +325,18 @@ public class ExampleMod implements ModInitializer {
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 11) {
+                        } else if (slotId == 10) { // Wasser
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) {
+                        } else if (slotId == 12) { // Lava
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) {
+                        } else if (slotId == 14) { // Obsidian
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 22) {
+                        } else if (slotId == 16) { // Whitelist-Übersicht öffnen
+                            openWhitelistMenu(sp);
+                        } else if (slotId == 22) { // Nachrichten Toggle (Name Tag)
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -376,25 +350,26 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
+        // Slot 4: Neuer Controller (Uhr, Fackel, Repeater)
         ItemStack ctrlItem;
         if (!isRunning) {
-            ctrlItem = new ItemStack(Blocks.EMERALD_BLOCK.asItem());
+            ctrlItem = new ItemStack(Items.CLOCK);
             ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§a§lChallenge starten"));
             ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
                 Component.literal("§7Status: §cNicht aktiv"),
                 Component.literal(""),
-                Component.literal("§8» §eKlick: Challenge & Timer starten!")
+                Component.literal("§8» §eKlick: Startet Timer & Block-Erkennung!")
             )));
         } else if (isPaused) {
-            ctrlItem = new ItemStack(Blocks.REDSTONE_BLOCK.asItem());
-            ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§c§lChallenge fortsetzen"));
+            ctrlItem = new ItemStack(Items.REPEATER);
+            ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§a§lChallenge fortsetzen"));
             ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
                 Component.literal("§7Status: §ePausiert"),
                 Component.literal(""),
                 Component.literal("§8» §eKlick: Fortsetzen")
             )));
         } else {
-            ctrlItem = new ItemStack(Blocks.GOLD_BLOCK.asItem());
+            ctrlItem = new ItemStack(Items.REDSTONE_TORCH);
             ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§e§lChallenge pausieren"));
             ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
                 Component.literal("§7Status: §aAktiv & läuft"),
@@ -404,26 +379,29 @@ public class ExampleMod implements ModInitializer {
         }
         container.setItem(4, ctrlItem);
 
+        // Slot 10: Wasser
         boolean waterOk = WHITELIST.contains(Blocks.WATER);
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
         waterItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn 16 Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (waterOk ? "§cWellen-Despawn starten & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
-        container.setItem(11, waterItem);
+        container.setItem(10, waterItem);
 
+        // Slot 12: Lava
         boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
         ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
         lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
         lavaItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn 16 Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (lavaOk ? "§cWellen-Despawn starten & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
-        container.setItem(13, lavaItem);
+        container.setItem(12, lavaItem);
 
+        // Slot 14: Obsidian
         boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
         ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
         obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
@@ -432,9 +410,20 @@ public class ExampleMod implements ModInitializer {
             Component.literal(""),
             Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren"))
         )));
-        container.setItem(15, obsItem);
+        container.setItem(14, obsItem);
 
-        ItemStack msgItem = new ItemStack(showBroadcasts ? Blocks.EMERALD_BLOCK.asItem() : Blocks.REDSTONE_BLOCK.asItem());
+        // Slot 16: Whitelist GUI öffnen
+        ItemStack bookItem = new ItemStack(Items.BOOK);
+        bookItem.set(DataComponents.CUSTOM_NAME, Component.literal("§d§lWhitelist Übersicht"));
+        bookItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Aktuell geschützt: §e" + WHITELIST.size() + " Blöcke"),
+            Component.literal(""),
+            Component.literal("§8» §eKlick: Liste ansehen & Blöcke per Klick entfernen!")
+        )));
+        container.setItem(16, bookItem);
+
+        // Slot 22: Nachrichten (Nametag statt Smaragdblock)
+        ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (showBroadcasts ? "§aAktiviert" : "§cStumm")),
@@ -444,12 +433,63 @@ public class ExampleMod implements ModInitializer {
         container.setItem(22, msgItem);
     }
 
+    // Whitelist-Verwaltungs-Menü
+    private static void openWhitelistMenu(ServerPlayer player) {
+        player.openMenu(new SimpleMenuProvider((syncId, playerInv, p) -> {
+            SimpleContainer container = new SimpleContainer(27);
+            List<Block> list = new ArrayList<>();
+            for (Block b : WHITELIST) {
+                if (b.asItem() != Items.AIR) list.add(b);
+            }
+
+            for (int i = 0; i < Math.min(list.size(), 26); i++) {
+                Block b = list.get(i);
+                ItemStack it = new ItemStack(b.asItem());
+                it.set(DataComponents.CUSTOM_NAME, Component.literal("§a" + b.getName().getString()));
+                it.set(DataComponents.LORE, new ItemLore(List.of(
+                    Component.literal("§7Dieser Block ist geschützt."),
+                    Component.literal(""),
+                    Component.literal("§8» §cKlick: Von der Whitelist entfernen!")
+                )));
+                container.setItem(i, it);
+            }
+
+            ItemStack backItem = new ItemStack(Items.BARRIER);
+            backItem.set(DataComponents.CUSTOM_NAME, Component.literal("§c« Zurück zum Hauptmenü"));
+            container.setItem(26, backItem);
+
+            return new ChestMenu(MenuType.GENERIC_9x3, syncId, playerInv, container, 3) {
+                @Override
+                public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
+                    if (slotId >= 0 && slotId < 27) {
+                        ServerPlayer sp = (ServerPlayer) clicker;
+                        if (!isHost(sp)) return;
+
+                        if (slotId == 26) {
+                            openChallengeMenu(sp);
+                            return;
+                        }
+
+                        if (slotId < list.size()) {
+                            Block removeBlock = list.get(slotId);
+                            WHITELIST.remove(removeBlock);
+                            sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + removeBlock.getName().getString() + " §7von der Whitelist entfernt!")));
+                            openWhitelistMenu(sp); // Ansicht aktualisieren
+                        }
+                        return;
+                    }
+                    super.clicked(slotId, button, containerInput, clicker);
+                }
+            };
+        }, Component.literal("§8» §dWhitelist Blöcke")));
+    }
+
     private static void toggleWater(ServerLevel level, ServerPlayer player) {
         if (WHITELIST.contains(Blocks.WATER)) {
             WHITELIST.remove(Blocks.WATER);
             BANNED_BLOCKS.add(Blocks.WATER);
-            purgeBlockFromLoadedChunks(level, Blocks.WATER);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen 16 Chunks gelöscht!")));
+            startRadialPurge(level, player.chunkPosition(), Blocks.WATER, 14);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt — Despawn-Welle gestartet!")));
         } else {
             WHITELIST.add(Blocks.WATER);
             BANNED_BLOCKS.remove(Blocks.WATER);
@@ -461,8 +501,8 @@ public class ExampleMod implements ModInitializer {
         if (WHITELIST.contains(Blocks.LAVA)) {
             WHITELIST.remove(Blocks.LAVA);
             BANNED_BLOCKS.add(Blocks.LAVA);
-            purgeBlockFromLoadedChunks(level, Blocks.LAVA);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt und in allen 16 Chunks gelöscht!")));
+            startRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 14);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt — Despawn-Welle gestartet!")));
         } else {
             WHITELIST.add(Blocks.LAVA);
             BANNED_BLOCKS.remove(Blocks.LAVA);
@@ -484,42 +524,32 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    private static void purgeBlockFromLoadedChunks(ServerLevel level, Block targetBlock) {
-        Set<ChunkPos> checked = new HashSet<>();
-        int chunkRadius = 16;
+    // Radiale Sortierung: Chunks von innen nach außen bereinigen
+    private static void startRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
+        List<ChunkPos> chunks = new ArrayList<>();
 
-        for (ServerPlayer player : level.players()) {
-            int centerX = player.chunkPosition().x();
-            int centerZ = player.chunkPosition().z();
-
-            for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
-                for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
-                    int targetX = centerX + dx;
-                    int targetZ = centerZ + dz;
-                    ChunkPos cPos = new ChunkPos(targetX, targetZ);
-
-                    if (checked.add(cPos)) {
-                        LevelChunk chunk = level.getChunkSource().getChunk(targetX, targetZ, false);
-                        if (chunk != null) {
-                            clearChunkDirect(level, chunk, targetBlock);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private static void purgeLocalChunks(ServerLevel level, ChunkPos center, int radius) {
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
-                LevelChunk chunk = level.getChunkSource().getChunk(center.x() + dx, center.z() + dz, false);
-                if (chunk != null) {
-                    clearChunkDirect(level, chunk, null);
+                if (dx * dx + dz * dz <= radius * radius) {
+                    chunks.add(new ChunkPos(center.x() + dx, center.z() + dz));
                 }
             }
         }
+
+        // Sortieren nach Distanz zum Spieler (nächste Chunks zuerst)
+        chunks.sort(Comparator.comparingInt(cp -> {
+            int ox = cp.x() - center.x();
+            int oz = cp.z() - center.z();
+            return ox * ox + oz * oz;
+        }));
+
+        PURGE_QUEUE.clear();
+        PURGE_QUEUE.addAll(chunks);
+        purgeTargetBlock = targetBlock;
+        purgeLevel = level;
     }
 
+    // Palette-Filter: Überspringt leere Subchunks ohne Rechenlast
     private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
         LevelChunkSection[] sections = chunk.getSections();
         if (sections == null) return;
