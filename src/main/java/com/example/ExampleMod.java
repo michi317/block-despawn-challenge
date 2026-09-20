@@ -12,6 +12,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
 import net.minecraft.network.chat.TextColor;
+import net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -42,7 +43,15 @@ public class ExampleMod implements ModInitializer {
     public static Block currentSharedBlock = null;
     public static boolean showBroadcasts = true;
 
-    // Veränderbare Whitelist
+    // Challenge-Status
+    public static boolean isRunning = false;
+    public static boolean isPaused = false;
+    public static int timerSeconds = 0;
+    private static int timerTicks = 0;
+    private static int actionbarTicks = 0;
+
+    private static final Map<UUID, ChunkPos> LAST_CHUNKS = new HashMap<>();
+
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
         Blocks.OBSIDIAN,
         Blocks.AIR,
@@ -53,9 +62,13 @@ public class ExampleMod implements ModInitializer {
     ));
 
     private static final Random RANDOM = new Random();
-    private int tickTimer = 0;
 
-    // RGB Hex-Farbverlauf Generator
+    // Prüft, ob der Spieler Host / OP ist
+    public static boolean isHost(ServerPlayer player) {
+        return player.hasPermissions(2) || player.getServer().isSingleplayerOwner(player.getGameProfile());
+    }
+
+    // Farbverlauf für Challenge-Präfix
     public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
         MutableComponent comp = Component.empty();
         int len = text.length();
@@ -78,29 +91,73 @@ public class ExampleMod implements ModInitializer {
         return comp;
     }
 
-    // Modernes Präfix: Farbverlauf von Korallenrot (#FF3838) zu Sonnengold (#FFA800) ohne Klammern
     public static final Component PREFIX = Component.empty()
         .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
         .append(Component.literal(" §8» "));
 
     @Override
     public void onInitialize() {
-        // 1. Befehle registrieren (/challenge öffnet direkt das Menü)
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
+                // /challenge (Info für jeden Spieler abrufbar)
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null) openChallengeMenu(player);
+                    if (player != null && isHost(player)) {
+                        openChallengeMenu(player);
+                    } else {
+                        var src = context.getSource();
+                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Status: " + (isRunning ? (isPaused ? "§ePausiert" : "§aLäuft") : "§cNicht aktiv"))), false);
+                        String current = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Noch keiner";
+                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Aktueller Block: §a" + current)), false);
+                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Verbannte Blöcke: §c" + BANNED_BLOCKS.size())), false);
+                    }
                     return 1;
                 })
+                // /challenge menu (Nur für Host)
                 .then(Commands.literal("menu").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null) openChallengeMenu(player);
+                    if (player == null) return 0;
+                    if (!isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf das Menü öffnen!")));
+                        return 0;
+                    }
+                    openChallengeMenu(player);
                     return 1;
                 }))
+                // /challenge start (Nur für Host)
+                .then(Commands.literal("start").executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayer();
+                    if (player != null && !isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host kann die Challenge starten!")));
+                        return 0;
+                    }
+                    isRunning = true;
+                    isPaused = false;
+                    context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet!")), false);
+                    return 1;
+                }))
+                // /challenge pause (Nur für Host)
+                .then(Commands.literal("pause").executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayer();
+                    if (player != null && !isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host kann pausieren!")));
+                        return 0;
+                    }
+                    if (isRunning) {
+                        isPaused = !isPaused;
+                        String status = isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!";
+                        context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal(status)), false);
+                    }
+                    return 1;
+                }))
+                // /challenge whitelist (Nur für Host)
                 .then(Commands.literal("whitelist").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
+                    if (!isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Blöcke whitelisten!")));
+                        return 0;
+                    }
 
                     ItemStack held = player.getItemInHand(InteractionHand.MAIN_HAND);
                     if (held.getItem() instanceof BlockItem blockItem) {
@@ -111,6 +168,9 @@ public class ExampleMod implements ModInitializer {
                         } else {
                             WHITELIST.add(b);
                             BANNED_BLOCKS.remove(b);
+                            if (b.equals(currentSharedBlock)) {
+                                currentSharedBlock = null;
+                            }
                             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + b.getName().getString() + " §7zur Whitelist hinzugefügt!")));
                         }
                     } else {
@@ -121,7 +181,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 2. Platzieren blockieren + Flammeneffekt
+        // 1. Verhindern, dass verbannte Blöcke platziert werden
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -141,11 +201,35 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 3. Kontinuierlicher Server-Tick
+        // 2. Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
-            tickTimer++;
+            if (isRunning && !isPaused) {
+                timerTicks++;
+                if (timerTicks >= 20) {
+                    timerTicks = 0;
+                    timerSeconds++;
+                }
+            }
+
+            actionbarTicks++;
+            if (actionbarTicks >= 5) {
+                actionbarTicks = 0;
+                updateActionBar(server);
+            }
+
+            if (!isRunning || isPaused) {
+                return;
+            }
 
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                ChunkPos currentChunk = player.chunkPosition();
+                ChunkPos lastChunk = LAST_CHUNKS.put(player.getUUID(), currentChunk);
+                if (lastChunk != null && !lastChunk.equals(currentChunk) && !BANNED_BLOCKS.isEmpty()) {
+                    if (player.level() instanceof ServerLevel sl) {
+                        purgeLocalChunks(sl, currentChunk, 3);
+                    }
+                }
+
                 if (player.onGround()) {
                     BlockPos underPos = new BlockPos(player.getBlockX(), player.getBlockY() - 1, player.getBlockZ());
                     BlockState underState = player.level().getBlockState(underPos);
@@ -156,33 +240,30 @@ public class ExampleMod implements ModInitializer {
                             currentSharedBlock = currentBlock;
                             if (showBroadcasts) {
                                 server.getPlayerList().broadcastSystemMessage(
-                                    Component.empty().append(PREFIX).append(Component.literal("§aStartblock: §f§l" + currentBlock.getName().getString())),
+                                    Component.empty().append(PREFIX).append(Component.literal("§7Startblock: §a" + currentBlock.getName().getString())),
                                     false
                                 );
                             }
                         } else if (!currentBlock.equals(currentSharedBlock)) {
                             Block oldBlock = currentSharedBlock;
-                            if (!BANNED_BLOCKS.contains(oldBlock)) {
+
+                            if (!WHITELIST.contains(oldBlock) && !BANNED_BLOCKS.contains(oldBlock)) {
                                 BANNED_BLOCKS.add(oldBlock);
 
                                 if (showBroadcasts) {
                                     server.getPlayerList().broadcastSystemMessage(
                                         Component.empty().append(PREFIX)
-                                            .append(Component.literal("§f" + player.getName().getString() + " §8» §a§l" + currentBlock.getName().getString()))
-                                            .append(Component.literal(" §8| §c§m" + oldBlock.getName().getString() + "§c verbannt!")),
+                                            .append(Component.literal("§f" + player.getName().getString() + " §8» §7Neuer Block: §a" + currentBlock.getName().getString()))
+                                            .append(Component.literal(" §8| §7Verbannt: §c" + oldBlock.getName().getString())),
                                         false
                                     );
                                 }
 
                                 if (player.level() instanceof ServerLevel serverLevel) {
-                                    // Angenehmer Amethyst-Resonanzklang statt lauter Explosion
-                                    serverLevel.playSound(null, player.blockPosition(), SoundEvents.AMETHYST_BLOCK_RESONATE, SoundSource.BLOCKS, 0.8f, 1.0f);
-
-                                    // Block-Abbau-Partikel im Nahbereich um den Spieler
                                     BlockPos pPos = player.blockPosition();
-                                    for (int dx = -6; dx <= 6; dx++) {
-                                        for (int dy = -4; dy <= 4; dy++) {
-                                            for (int dz = -6; dz <= 6; dz++) {
+                                    for (int dx = -5; dx <= 5; dx++) {
+                                        for (int dy = -3; dy <= 3; dy++) {
+                                            for (int dz = -5; dz <= 5; dz++) {
                                                 BlockPos nearPos = pPos.offset(dx, dy, dz);
                                                 if (oldBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
                                                     serverLevel.levelEvent(2001, nearPos, Block.getId(oldBlock.defaultBlockState()));
@@ -191,26 +272,49 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    // Sofortiger 16-Chunk-Sweep um alle Spieler
                                     purgeBlockFromLoadedChunks(serverLevel, oldBlock);
                                 }
+                            } else if (showBroadcasts && WHITELIST.contains(oldBlock)) {
+                                server.getPlayerList().broadcastSystemMessage(
+                                    Component.empty().append(PREFIX).append(Component.literal("§f" + player.getName().getString() + " §8» §7Neuer Block: §a" + currentBlock.getName().getString())),
+                                    false
+                                );
                             }
                             currentSharedBlock = currentBlock;
                         }
                     }
                 }
             }
-
-            // Regelmäßiger Flächencheck (alle 20 Ticks / 1 Sekunde)
-            if (tickTimer % 20 == 0 && !BANNED_BLOCKS.isEmpty()) {
-                for (ServerLevel level : server.getAllLevels()) {
-                    purgeBlockFromLoadedChunks(level, null);
-                }
-            }
         });
     }
 
-    // Interaktives Kisten-Menü mit Beschreibungen
+    private static void updateActionBar(net.minecraft.server.MinecraftServer server) {
+        Component actionText;
+        int s = timerSeconds % 60;
+        int m = (timerSeconds / 60) % 60;
+        int h = timerSeconds / 3600;
+        String timeStr = (h > 0) ? String.format("%02d:%02d:%02d", h, m, s) : String.format("%02d:%02d", m, s);
+
+        if (!isRunning) {
+            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
+                    .append(Component.literal(" §8» §7§oNicht gestartet"));
+        } else if (isPaused) {
+            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
+                    .append(Component.literal(" §8» §7§oTimer pausiert §8(§e" + timeStr + "§8)"));
+        } else {
+            String bName = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Warten...";
+            actionText = Component.empty().append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
+                    .append(Component.literal(" §8» §e" + timeStr + " §8| §7Block: §a" + bName));
+        }
+
+        ClientboundSetActionBarTextPacket packet = new ClientboundSetActionBarTextPacket(actionText);
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.connection != null) {
+                player.connection.send(packet);
+            }
+        }
+    }
+
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -223,18 +327,30 @@ public class ExampleMod implements ModInitializer {
                 public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
                     if (slotId >= 0 && slotId < 27) {
                         ServerPlayer sp = (ServerPlayer) clicker;
+                        if (!isHost(sp)) return; // Sicherheits-Check: Nur Host darf im Menü klicken
+
                         ServerLevel sl = (ServerLevel) sp.level();
 
-                        if (slotId == 11) { // Wasser
+                        if (slotId == 4) {
+                            if (!isRunning) {
+                                isRunning = true;
+                                isPaused = false;
+                                sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet!")));
+                            } else {
+                                isPaused = !isPaused;
+                                sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
+                            }
+                            updateMenuIcons(container);
+                        } else if (slotId == 11) {
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) { // Lava
+                        } else if (slotId == 13) {
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) { // Obsidian
+                        } else if (slotId == 15) {
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 22) { // Nachrichten
+                        } else if (slotId == 22) {
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -248,43 +364,64 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        // Wasser
+        ItemStack ctrlItem;
+        if (!isRunning) {
+            ctrlItem = new ItemStack(Blocks.EMERALD_BLOCK.asItem());
+            ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§a§lChallenge starten"));
+            ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.literal("§7Status: §cNicht aktiv"),
+                Component.literal(""),
+                Component.literal("§8» §eKlick: Challenge & Timer starten!")
+            )));
+        } else if (isPaused) {
+            ctrlItem = new ItemStack(Blocks.REDSTONE_BLOCK.asItem());
+            ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§c§lChallenge fortsetzen"));
+            ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.literal("§7Status: §ePausiert"),
+                Component.literal(""),
+                Component.literal("§8» §eKlick: Fortsetzen")
+            )));
+        } else {
+            ctrlItem = new ItemStack(Blocks.GOLD_BLOCK.asItem());
+            ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§e§lChallenge pausieren"));
+            ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.literal("§7Status: §aAktiv & läuft"),
+                Component.literal(""),
+                Component.literal("§8» §eKlick: Pausieren")
+            )));
+        }
+        container.setItem(4, ctrlItem);
+
         boolean waterOk = WHITELIST.contains(Blocks.WATER);
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
         waterItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt & Gelöscht")),
+            Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn 16 Chunks verdampfen & verbannen" : "§aWieder zur Whitelist hinzufügen")),
-            Component.literal("§8» §7Löscht Ozeane ohne fließendes Wasser & ohne Gravel-Fall!")
+            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn 16 Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
         container.setItem(11, waterItem);
 
-        // Lava
         boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
         ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
         lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
         lavaItem.set(DataComponents.LORE, new ItemLore(List.of(
-            Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt & Gelöscht")),
+            Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn 16 Chunks leeren & verbannen" : "§aWieder zur Whitelist hinzufügen")),
-            Component.literal("§8» §7Entfernt Lavaseen über die komplette Welthöhe.")
+            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn 16 Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
         container.setItem(13, lavaItem);
 
-        // Obsidian
         boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
         ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
         obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
         obsItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (obsOk ? "§a§lGeschützt" : "§c§lNicht geschützt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren")),
-            Component.literal("§8» §7Verhindert das Löschen beim Portal-Bauen.")
+            Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren"))
         )));
         container.setItem(15, obsItem);
 
-        // Meldungen
         ItemStack msgItem = new ItemStack(showBroadcasts ? Blocks.EMERALD_BLOCK.asItem() : Blocks.REDSTONE_BLOCK.asItem());
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -300,7 +437,7 @@ public class ExampleMod implements ModInitializer {
             WHITELIST.remove(Blocks.WATER);
             BANNED_BLOCKS.add(Blocks.WATER);
             purgeBlockFromLoadedChunks(level, Blocks.WATER);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen 16 Chunks verdampft!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen 16 Chunks gelöscht!")));
         } else {
             WHITELIST.add(Blocks.WATER);
             BANNED_BLOCKS.remove(Blocks.WATER);
@@ -328,11 +465,13 @@ public class ExampleMod implements ModInitializer {
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
+            if (block.equals(currentSharedBlock)) {
+                currentSharedBlock = null;
+            }
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + block.getName().getString() + " ist nun geschützt!")));
         }
     }
 
-    // Scannt alle Chunks im Radius von 16 Chunks um jeden Spieler
     private static void purgeBlockFromLoadedChunks(ServerLevel level, Block targetBlock) {
         Set<ChunkPos> checked = new HashSet<>();
         int chunkRadius = 16;
@@ -358,7 +497,17 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Bereinigt Chunks ohne Block-Updates (Gravel/Sand bleibt frei in der Luft schweben)
+    private static void purgeLocalChunks(ServerLevel level, ChunkPos center, int radius) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                LevelChunk chunk = level.getChunkSource().getChunk(center.x() + dx, center.z() + dz, false);
+                if (chunk != null) {
+                    clearChunkDirect(level, chunk, null);
+                }
+            }
+        }
+    }
+
     private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
         LevelChunkSection[] sections = chunk.getSections();
         if (sections == null) return;
@@ -371,6 +520,10 @@ public class ExampleMod implements ModInitializer {
         for (int sIndex = 0; sIndex < sections.length; sIndex++) {
             LevelChunkSection section = sections[sIndex];
             if (section == null || section.hasOnlyAir()) continue;
+
+            if (!section.maybeHas(state -> (specificBlock != null) ? state.is(specificBlock) : BANNED_BLOCKS.contains(state.getBlock()))) {
+                continue;
+            }
 
             int sectionBottomY = (minSectionY + sIndex) * 16;
 
@@ -385,7 +538,6 @@ public class ExampleMod implements ModInitializer {
                         if (shouldDelete) {
                             int worldY = sectionBottomY + y;
                             mPos.set(startX + x, worldY, startZ + z);
-                            // Flag 2 = Client rendert Luft | Flag 16 = Drops unterdrücken (KEIN Flag 1 -> kein Gravitations-Update für Gravel)
                             level.setBlock(mPos, Blocks.AIR.defaultBlockState(), 2 | 16);
                         }
                     }
