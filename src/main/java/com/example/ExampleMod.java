@@ -23,7 +23,8 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
-import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.ContainerInput;
@@ -42,7 +43,6 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
-import java.lang.reflect.Field;
 import java.util.*;
 
 public class ExampleMod implements ModInitializer {
@@ -97,7 +97,6 @@ public class ExampleMod implements ModInitializer {
         return HOSTS.contains(player.getUUID());
     }
 
-    // Setzt sämtliche internen Challenge-Zustände restlos zurück
     public static void resetChallengeState() {
         BANNED_BLOCKS.clear();
         isRunning = false;
@@ -147,32 +146,6 @@ public class ExampleMod implements ModInitializer {
     public static final Component PREFIX = Component.empty()
         .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
         .append(Component.literal(" §7» "));
-
-    public static void setGameRuleInternal(net.minecraft.server.MinecraftServer server, String ruleName, boolean value) {
-        try {
-            Object gameRules = server.getGameRules();
-            for (Field f : gameRules.getClass().getDeclaredFields()) {
-                if (Map.class.isAssignableFrom(f.getType())) {
-                    f.setAccessible(true);
-                    Map<?, ?> map = (Map<?, ?>) f.get(gameRules);
-                    if (map != null) {
-                        for (Map.Entry<?, ?> entry : map.entrySet()) {
-                            Object key = entry.getKey();
-                            Object val = entry.getValue();
-                            if (key != null && key.toString().equalsIgnoreCase(ruleName)) {
-                                for (Field vf : val.getClass().getDeclaredFields()) {
-                                    if (vf.getType() == boolean.class) {
-                                        vf.setAccessible(true);
-                                        vf.setBoolean(val, value);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception ignored) {}
-    }
 
     @Override
     public void onInitialize() {
@@ -239,7 +212,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Tödlichen Schaden abfangen
+        // 1. Tödlichen Schaden abfangen (Kein Respawn-Screen, keine Vanilla-Meldung, sofort Spectator)
         ServerLivingEntityEvents.ALLOW_DEATH.register((entity, damageSource, damageAmount) -> {
             if (entity instanceof ServerPlayer player && isRunning) {
                 ServerLevel sl = (ServerLevel) player.level();
@@ -258,7 +231,34 @@ public class ExampleMod implements ModInitializer {
             return true;
         });
 
-        // 2. Platzieren verbotener Blöcke
+        // 2. Schadensanzeige im Chat (Wer hat wie viel Schaden durch was bekommen)
+        ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, damageSource, baseDamageTaken, damageTaken, blocked) -> {
+            if (!isRunning || isPaused || blocked || damageTaken <= 0.01f) return;
+            if (entity instanceof ServerPlayer player) {
+                if (showBroadcasts) {
+                    float hearts = damageTaken / 2.0f;
+                    String heartStr;
+                    if (Math.abs(hearts - 1.0f) < 0.05f) {
+                        heartStr = "1 Herz";
+                    } else if (Math.abs(hearts - Math.round(hearts)) < 0.05f) {
+                        heartStr = Math.round(hearts) + " Herzen";
+                    } else {
+                        heartStr = String.format(Locale.GERMAN, "%.1f", hearts) + " Herzen";
+                    }
+
+                    String desc = getDamageDescription(player, damageSource);
+                    String msg = desc + " §8(§c-" + heartStr + "§8)";
+                    if (player.level() instanceof ServerLevel sl) {
+                        sl.getServer().getPlayerList().broadcastSystemMessage(
+                            Component.empty().append(PREFIX).append(Component.literal(msg)),
+                            false
+                        );
+                    }
+                }
+            }
+        });
+
+        // 3. Verbotene Blöcke platzieren
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             if (!blockDeleteEnabled) return InteractionResult.PASS;
 
@@ -292,15 +292,18 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 3. Server-Tick
+        // 4. Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (HOSTS.isEmpty() && !server.getPlayerList().getPlayers().isEmpty()) {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
+            // Gamerules synchronisieren & Command-Feedback stummschalten
             if (server.getTickCount() % 40 == 0) {
-                setGameRuleInternal(server, "showDeathMessages", false);
-                setGameRuleInternal(server, "naturalRegeneration", !uhcMode);
+                var source = server.createCommandSourceStack().withSuppressedOutput();
+                server.getCommands().performPrefixedCommand(source, "gamerule showDeathMessages false");
+                server.getCommands().performPrefixedCommand(source, "gamerule sendCommandFeedback false");
+                server.getCommands().performPrefixedCommand(source, "gamerule naturalRegeneration " + (!uhcMode));
             }
 
             if (sharedHearts && !syncingHealth) {
@@ -321,7 +324,7 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Multi-Player Live-Radar für alle 5 Spieler
+            // Multi-Player Live-Radar für alle Spieler
             if (blockDeleteEnabled && !BANNED_BLOCKS.isEmpty()) {
                 List<ServerPlayer> players = server.getPlayerList().getPlayers();
                 if (!players.isEmpty()) {
@@ -399,6 +402,50 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
+    private static String getDamageDescription(ServerPlayer victim, DamageSource source) {
+        String victimName = victim.getName().getString();
+        Entity attacker = source.getEntity();
+
+        if (attacker instanceof ServerPlayer playerAttacker) {
+            if (playerAttacker == victim) {
+                return "§f" + victimName + " §7hat sich selbst verletzt";
+            } else {
+                return "§f" + playerAttacker.getName().getString() + " §7hat §f" + victimName + " §7geschlagen";
+            }
+        } else if (attacker != null) {
+            return "§f" + victimName + " §7wurde von §e" + attacker.getName().getString() + " §7angegriffen";
+        }
+
+        String msgId = source.getMsgId();
+        if ("fall".equals(msgId)) {
+            return "§f" + victimName + " §7hat Fallschaden erlitten";
+        } else if ("inFire".equals(msgId) || "onFire".equals(msgId)) {
+            return "§f" + victimName + " §7verbrennt";
+        } else if ("lava".equals(msgId)) {
+            return "§f" + victimName + " §7hat Lavaschaden erlitten";
+        } else if ("drown".equals(msgId)) {
+            return "§f" + victimName + " §7ertrinkt";
+        } else if ("starve".equals(msgId)) {
+            return "§f" + victimName + " §7verhungert";
+        } else if ("cactus".equals(msgId)) {
+            return "§f" + victimName + " §7wurde von einem Kaktus gestochen";
+        } else if ("explosion".equals(msgId) || "player_explosion".equals(msgId) || "badRespawnPoint".equals(msgId)) {
+            return "§f" + victimName + " §7erlitt Explosionsschaden";
+        } else if ("magic".equals(msgId) || "indirectMagic".equals(msgId)) {
+            return "§f" + victimName + " §7erlitt Magieschaden";
+        } else if ("wither".equals(msgId)) {
+            return "§f" + victimName + " §7erlitt Witherschaden";
+        } else if ("freeze".equals(msgId)) {
+            return "§f" + victimName + " §7erfriert";
+        } else if ("lightningBolt".equals(msgId)) {
+            return "§f" + victimName + " §7wurde vom Blitz getroffen";
+        } else if ("flyIntoWall".equals(msgId)) {
+            return "§f" + victimName + " §7ist gegen eine Wand geflogen";
+        }
+
+        return "§f" + victimName + " §7hat Schaden erlitten";
+    }
+
     private static void cleanRingForPlayer(ServerLevel level, int px, int pz, int r) {
         String worldKey = level.dimension().toString();
         Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
@@ -474,6 +521,7 @@ public class ExampleMod implements ModInitializer {
         return bestBlock;
     }
 
+    // Synchrone Herzen: Heilung nur über echte Items (Goldäpfel, Heiltränke, etc.)
     private static void handleSharedHeartsSynchronized(net.minecraft.server.MinecraftServer server) {
         List<ServerPlayer> players = server.getPlayerList().getPlayers();
         if (players.size() < 2) {
@@ -493,10 +541,8 @@ public class ExampleMod implements ModInitializer {
             if (hp < last) {
                 damageOccurred = true;
             } else if (hp > last) {
-                if (!uhcMode || p.hasEffect(MobEffects.REGENERATION)) {
-                    float diff = hp - last;
-                    if (diff > healAmount) healAmount = diff;
-                }
+                float diff = hp - last;
+                if (diff > healAmount) healAmount = diff;
             }
             if (hp < minHp) minHp = hp;
         }
@@ -561,6 +607,11 @@ public class ExampleMod implements ModInitializer {
         if (host == null || server == null) return;
         isRunning = true;
         isPaused = false;
+
+        var source = server.createCommandSourceStack().withSuppressedOutput();
+        server.getCommands().performPrefixedCommand(source, "gamerule naturalRegeneration " + (!uhcMode));
+        server.getCommands().performPrefixedCommand(source, "gamerule showDeathMessages false");
+        server.getCommands().performPrefixedCommand(source, "gamerule sendCommandFeedback false");
 
         if (blockDeleteEnabled) {
             Block hostBlock = getBlockUnderPlayer(host);
@@ -776,7 +827,7 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(16, bookItem);
 
-        // Unten Mitte: Meldungen
+        // Slot 22: Meldungen
         ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -805,7 +856,9 @@ public class ExampleMod implements ModInitializer {
 
     private static void toggleUhc(ServerLevel level, ServerPlayer player) {
         uhcMode = !uhcMode;
-        setGameRuleInternal(level.getServer(), "naturalRegeneration", !uhcMode);
+        var source = level.getServer().createCommandSourceStack().withSuppressedOutput();
+        level.getServer().getCommands().performPrefixedCommand(source, "gamerule naturalRegeneration " + (!uhcMode));
+
         level.getServer().getPlayerList().broadcastSystemMessage(
             Component.empty().append(PREFIX).append(Component.literal("§eUltra Hardcore (UHC) §7» " + 
                 (uhcMode ? "§aAktiviert" : "§cDeaktiviert"))),
