@@ -16,8 +16,9 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
-import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
@@ -222,7 +223,7 @@ public class ExampleMod implements ModInitializer {
 
             return new ChestMenu(MenuType.GENERIC_9x3, syncId, playerInv, container, 3) {
                 @Override
-                public void clicked(int slotId, int button, ClickType clickType, net.minecraft.world.entity.player.Player clicker) {
+                public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
                     if (slotId >= 0 && slotId < 27) {
                         ServerPlayer sp = (ServerPlayer) clicker;
                         ServerLevel sl = (ServerLevel) sp.level();
@@ -241,9 +242,9 @@ public class ExampleMod implements ModInitializer {
                             sp.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert")));
                             updateMenuIcons(container);
                         }
-                        return; // Klick abfangen, Items bleiben im Menü
+                        return; // Klick abfangen, Items bleiben sicher im Menü
                     }
-                    super.clicked(slotId, button, clickType, clicker);
+                    super.clicked(slotId, button, containerInput, clicker);
                 }
             };
         }, Component.literal("§8» §6Challenge Menü")));
@@ -252,8 +253,9 @@ public class ExampleMod implements ModInitializer {
     private static void updateMenuIcons(SimpleContainer container) {
         container.setItem(11, new ItemStack(Items.WATER_BUCKET));
         container.setItem(13, new ItemStack(Items.LAVA_BUCKET));
-        container.setItem(15, new ItemStack(Items.OBSIDIAN));
-        container.setItem(22, new ItemStack(showBroadcasts ? Items.LIME_DYE : Items.GRAY_DYE));
+        container.setItem(15, new ItemStack(Blocks.OBSIDIAN.asItem()));
+        // Smaragdblock = An / Redstoneblock = Aus
+        container.setItem(22, new ItemStack(showBroadcasts ? Blocks.EMERALD_BLOCK.asItem() : Blocks.REDSTONE_BLOCK.asItem()));
     }
 
     private static void toggleWater(ServerLevel level, ServerPlayer player) {
@@ -312,7 +314,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Großflächen-Despawn mit authentischen Block-Abbau-Partikeln
+    // Großflächen-Despawn mit Block-Abbau-Partikeln
     private static void clearAreaWithEffects(ServerLevel level, BlockPos center, Block targetBlock, int radius) {
         int minY = Math.max(level.getMinY(), center.getY() - 25);
         int maxY = Math.min(level.getMaxY(), center.getY() + 35);
@@ -325,7 +327,6 @@ public class ExampleMod implements ModInitializer {
                         BlockState state = level.getBlockState(pos);
 
                         if (state.is(targetBlock)) {
-                            // Im Nahbereich (14 Blöcke) Abbau-Partikel und Geräusche abspielen
                             if (pos.closerThan(center, 14) && RANDOM.nextFloat() < 0.25f) {
                                 level.levelEvent(2001, pos, Block.getId(state));
                             }
