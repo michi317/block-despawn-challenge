@@ -63,9 +63,15 @@ public class ExampleMod implements ModInitializer {
 
     private static final Random RANDOM = new Random();
 
-    // Prüft, ob der Spieler Host / OP ist
+    // Zuverlässige Prüfung: Host der Singleplayer-Welt oder Operator (OP)
     public static boolean isHost(ServerPlayer player) {
-        return player.hasPermissions(2) || player.getServer().isSingleplayerOwner(player.getGameProfile());
+        if (player.createCommandSourceStack().hasPermission(2)) {
+            return true;
+        }
+        if (player.level() instanceof ServerLevel serverLevel) {
+            return serverLevel.getServer().isSingleplayerOwner(player.getGameProfile());
+        }
+        return false;
     }
 
     // Farbverlauf für Challenge-Präfix
@@ -99,7 +105,7 @@ public class ExampleMod implements ModInitializer {
     public void onInitialize() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
-                // /challenge (Info für jeden Spieler abrufbar)
+                // /challenge (Statusabfrage für jeden; Host öffnet Menü)
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player != null && isHost(player)) {
@@ -113,22 +119,22 @@ public class ExampleMod implements ModInitializer {
                     }
                     return 1;
                 })
-                // /challenge menu (Nur für Host)
+                // /challenge menu (Nur Host)
                 .then(Commands.literal("menu").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
                     if (!isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf das Menü öffnen!")));
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
                         return 0;
                     }
                     openChallengeMenu(player);
                     return 1;
                 }))
-                // /challenge start (Nur für Host)
+                // /challenge start (Nur Host)
                 .then(Commands.literal("start").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host kann die Challenge starten!")));
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
                         return 0;
                     }
                     isRunning = true;
@@ -136,11 +142,11 @@ public class ExampleMod implements ModInitializer {
                     context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet!")), false);
                     return 1;
                 }))
-                // /challenge pause (Nur für Host)
+                // /challenge pause (Nur Host)
                 .then(Commands.literal("pause").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player != null && !isHost(player)) {
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host kann pausieren!")));
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
                         return 0;
                     }
                     if (isRunning) {
@@ -150,7 +156,7 @@ public class ExampleMod implements ModInitializer {
                     }
                     return 1;
                 }))
-                // /challenge whitelist (Nur für Host)
+                // /challenge whitelist (Nur Host)
                 .then(Commands.literal("whitelist").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
@@ -201,7 +207,7 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 2. Server-Tick
+        // 2. Kontinuierlicher Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (isRunning && !isPaused) {
                 timerTicks++;
@@ -327,7 +333,7 @@ public class ExampleMod implements ModInitializer {
                 public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
                     if (slotId >= 0 && slotId < 27) {
                         ServerPlayer sp = (ServerPlayer) clicker;
-                        if (!isHost(sp)) return; // Sicherheits-Check: Nur Host darf im Menü klicken
+                        if (!isHost(sp)) return; // Klicks für Nicht-Hosts ignorieren
 
                         ServerLevel sl = (ServerLevel) sp.level();
 
