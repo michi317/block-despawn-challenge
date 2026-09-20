@@ -40,7 +40,6 @@ import java.util.*;
 
 public class ExampleMod implements ModInitializer {
     public static final Set<Block> BANNED_BLOCKS = new HashSet<>();
-    public static Block currentSharedBlock = null;
     public static boolean showBroadcasts = true;
 
     // Challenge-Status
@@ -50,7 +49,10 @@ public class ExampleMod implements ModInitializer {
     private static int timerTicks = 0;
     private static int actionbarTicks = 0;
 
-    // Performance Wave Queue
+    // Jeder Spieler besitzt seinen eigenen letzten Stand-Block
+    private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
+
+    // Performance-Wellen-Queue
     private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
     private static Block purgeTargetBlock = null;
     private static ServerLevel purgeLevel = null;
@@ -58,7 +60,7 @@ public class ExampleMod implements ModInitializer {
     // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
 
-    // Veränderbare Whitelist
+    // Whitelist
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
         Blocks.OBSIDIAN,
         Blocks.AIR,
@@ -78,7 +80,6 @@ public class ExampleMod implements ModInitializer {
         return HOSTS.contains(player.getUUID());
     }
 
-    // Hex-Farbverlauf (#FF3838 -> #FFA800)
     public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
         MutableComponent comp = Component.empty();
         int len = text.length();
@@ -116,8 +117,6 @@ public class ExampleMod implements ModInitializer {
                     } else {
                         var src = context.getSource();
                         src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Status: " + (isRunning ? (isPaused ? "§ePausiert" : "§aLäuft") : "§cNicht aktiv"))), false);
-                        String current = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Noch keiner";
-                        src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Aktueller Block: §a" + current)), false);
                         src.sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal("§7Verbannte Blöcke: §c" + BANNED_BLOCKS.size())), false);
                     }
                     return 1;
@@ -130,6 +129,28 @@ public class ExampleMod implements ModInitializer {
                         return 0;
                     }
                     openChallengeMenu(player);
+                    return 1;
+                }))
+                .then(Commands.literal("start").executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayer();
+                    if (player != null && !isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
+                        return 0;
+                    }
+                    startChallengeWithHost(player);
+                    return 1;
+                }))
+                .then(Commands.literal("pause").executes(context -> {
+                    ServerPlayer player = context.getSource().getPlayer();
+                    if (player != null && !isHost(player)) {
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cNur der Host darf Einstellungen verändern!")));
+                        return 0;
+                    }
+                    if (isRunning) {
+                        isPaused = !isPaused;
+                        String status = isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!";
+                        context.getSource().sendSuccess(() -> Component.empty().append(PREFIX).append(Component.literal(status)), false);
+                    }
                     return 1;
                 }))
                 .then(Commands.literal("whitelist").executes(context -> {
@@ -149,9 +170,6 @@ public class ExampleMod implements ModInitializer {
                         } else {
                             WHITELIST.add(b);
                             BANNED_BLOCKS.remove(b);
-                            if (b.equals(currentSharedBlock)) {
-                                currentSharedBlock = null;
-                            }
                             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + b.getName().getString() + " §7zur Whitelist hinzugefügt!")));
                         }
                     } else {
@@ -162,19 +180,30 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // Verhindern, dass verbotene Blöcke platziert werden
+        // 1. Ghost-Item freies Platzieren verhinderter Blöcke
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
                 if (BANNED_BLOCKS.contains(blockItem.getBlock())) {
                     if (level instanceof ServerLevel serverLevel) {
                         BlockPos targetPos = hitResult.getBlockPos().relative(hitResult.getDirection());
-                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 12, 0.2, 0.2, 0.2, 0.05);
-                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.6f, 1.2f);
+
+                        // Verbrenn-Sound und Partikel
+                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.9f, 1.1f);
+                        serverLevel.sendParticles(ParticleTypes.LAVA, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 6, 0.2, 0.2, 0.2, 0.05);
+                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 14, 0.25, 0.25, 0.25, 0.05);
+                        serverLevel.sendParticles(ParticleTypes.SMOKE, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 10, 0.2, 0.2, 0.2, 0.02);
+
                         player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + blockItem.getBlock().getName().getString() + " §7ist verbannt!")));
                     }
+
+                    // Item sicher vernichten und Inventar synchronisieren (kein Geister-Item)
                     if (!player.isCreative()) {
                         stack.shrink(1);
+                        if (player instanceof ServerPlayer sp) {
+                            sp.containerMenu.broadcastChanges();
+                            sp.inventoryMenu.broadcastChanges();
+                        }
                     }
                     return InteractionResult.FAIL;
                 }
@@ -182,7 +211,7 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // Haupt Server-Tick
+        // 2. Kontinuierlicher Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (HOSTS.isEmpty() && !server.getPlayerList().getPlayers().isEmpty()) {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
@@ -196,16 +225,15 @@ public class ExampleMod implements ModInitializer {
                 }
             }
 
-            // Actionbar alle 5 Ticks synchronisieren
             actionbarTicks++;
             if (actionbarTicks >= 5) {
                 actionbarTicks = 0;
                 updateActionBar(server);
             }
 
-            // Wave-Queue verarbeiten (4 Chunks pro Tick = 80 Chunks/Sekunde flüssig ohne Lag)
+            // Schnelle 16-Chunks/Tick Schockwelle
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
-                for (int i = 0; i < 4 && !PURGE_QUEUE.isEmpty(); i++) {
+                for (int i = 0; i < 16 && !PURGE_QUEUE.isEmpty(); i++) {
                     ChunkPos cp = PURGE_QUEUE.poll();
                     LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
                     if (chunk != null) {
@@ -218,54 +246,47 @@ public class ExampleMod implements ModInitializer {
 
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 if (player.onGround()) {
-                    BlockPos underPos = new BlockPos(player.getBlockX(), player.getBlockY() - 1, player.getBlockZ());
-                    BlockState underState = player.level().getBlockState(underPos);
-                    Block currentBlock = underState.getBlock();
+                    Block currentBlock = getBlockUnderPlayer(player);
 
-                    if (!WHITELIST.contains(currentBlock) && !underState.isAir()) {
-                        if (currentSharedBlock == null) {
-                            currentSharedBlock = currentBlock;
-                            if (showBroadcasts) {
-                                server.getPlayerList().broadcastSystemMessage(
-                                    Component.empty().append(PREFIX).append(Component.literal("§7Startblock: §a" + currentBlock.getName().getString())),
-                                    false
-                                );
-                            }
-                        } else if (!currentBlock.equals(currentSharedBlock)) {
-                            Block oldBlock = currentSharedBlock;
+                    if (currentBlock != null && !WHITELIST.contains(currentBlock)) {
+                        Block lastBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
 
-                            if (!WHITELIST.contains(oldBlock) && !BANNED_BLOCKS.contains(oldBlock)) {
-                                BANNED_BLOCKS.add(oldBlock);
+                        if (lastBlock == null) {
+                            // Spieler startet auf diesem Block
+                            PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
+                        } else if (!currentBlock.equals(lastBlock)) {
+                            // Spieler hat AKTIV seinen bisherigen Block verlassen!
+                            if (!WHITELIST.contains(lastBlock) && !BANNED_BLOCKS.contains(lastBlock)) {
+                                BANNED_BLOCKS.add(lastBlock);
 
-                                // Klarer, zusammenhängender deutscher Satz
                                 if (showBroadcasts) {
                                     server.getPlayerList().broadcastSystemMessage(
                                         Component.empty().append(PREFIX)
                                             .append(Component.literal("§f" + player.getName().getString() + " §7hat §a" + currentBlock.getName().getString()))
-                                            .append(Component.literal(" §7betreten §8— §c" + oldBlock.getName().getString() + " §7wurde verbannt!")),
+                                            .append(Component.literal(" §7betreten §8— §c" + lastBlock.getName().getString() + " §7wurde verbannt!")),
                                         false
                                     );
                                 }
 
                                 if (player.level() instanceof ServerLevel serverLevel) {
-                                    // Nahbereichs-Partikel um den Spieler
+                                    // Abbau-Partikel um den Spieler
                                     BlockPos pPos = player.blockPosition();
                                     for (int dx = -5; dx <= 5; dx++) {
                                         for (int dy = -3; dy <= 3; dy++) {
                                             for (int dz = -5; dz <= 5; dz++) {
                                                 BlockPos nearPos = pPos.offset(dx, dy, dz);
-                                                if (oldBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
-                                                    serverLevel.levelEvent(2001, nearPos, Block.getId(oldBlock.defaultBlockState()));
+                                                if (lastBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
+                                                    serverLevel.levelEvent(2001, nearPos, Block.getId(lastBlock.defaultBlockState()));
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Radiale Schockwelle starten (von innen nach außen)
-                                    startRadialPurge(serverLevel, player.chunkPosition(), oldBlock, 14);
+                                    // Sofortiger Nah-Despawn + schnelle Schockwelle
+                                    startFastRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 16);
                                 }
                             }
-                            currentSharedBlock = currentBlock;
+                            PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
                         }
                     }
                 }
@@ -273,32 +294,64 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Actionbar ohne "Challenge »"
+    private static Block getBlockUnderPlayer(ServerPlayer player) {
+        BlockPos pPos = player.blockPosition();
+        BlockState state = player.level().getBlockState(pPos.below());
+        if (!state.isAir()) return state.getBlock();
+
+        // 1 Block tiefer prüfen (z. B. bei Schnee/Teppich)
+        BlockState deep = player.level().getBlockState(pPos.below(2));
+        if (!deep.isAir()) return deep.getBlock();
+
+        return null;
+    }
+
+    public static void startChallengeWithHost(ServerPlayer host) {
+        if (host == null) return;
+        isRunning = true;
+        isPaused = false;
+
+        Block hostBlock = getBlockUnderPlayer(host);
+        if (hostBlock == null || WHITELIST.contains(hostBlock)) {
+            hostBlock = Blocks.GRASS_BLOCK;
+        }
+
+        PLAYER_CURRENT_BLOCKS.clear();
+        for (ServerPlayer p : host.server.getPlayerList().getPlayers()) {
+            PLAYER_CURRENT_BLOCKS.put(p.getUUID(), hostBlock);
+        }
+
+        host.server.getPlayerList().broadcastSystemMessage(
+            Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7Startblock: §f§l" + hostBlock.getName().getString())),
+            false
+        );
+    }
+
+    // Personalisierte Actionbar (Timer + eigener Block)
     private static void updateActionBar(net.minecraft.server.MinecraftServer server) {
-        Component actionText;
         int s = timerSeconds % 60;
         int m = (timerSeconds / 60) % 60;
         int h = timerSeconds / 3600;
         String timeStr = (h > 0) ? String.format("%02d:%02d:%02d", h, m, s) : String.format("%02d:%02d", m, s);
 
-        if (!isRunning) {
-            actionText = Component.literal("§7§oChallenge nicht gestartet §8(/challenge)");
-        } else if (isPaused) {
-            actionText = Component.literal("§7§oTimer pausiert §8(§e" + timeStr + "§8)");
-        } else {
-            String bName = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Warten...";
-            actionText = Component.literal("§e§l" + timeStr + " §8| §7Block: §a§l" + bName);
-        }
-
-        ClientboundSetActionBarTextPacket packet = new ClientboundSetActionBarTextPacket(actionText);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            Component actionText;
+            if (!isRunning) {
+                actionText = Component.literal("§7§oChallenge nicht gestartet §8(/challenge)");
+            } else if (isPaused) {
+                actionText = Component.literal("§7§oTimer pausiert §8(§e" + timeStr + "§8)");
+            } else {
+                Block myBlock = PLAYER_CURRENT_BLOCKS.get(player.getUUID());
+                String bName = (myBlock != null) ? myBlock.getName().getString() : "Warten...";
+                actionText = Component.literal("§e§l" + timeStr + " §8| §7Block: §a§l" + bName);
+            }
+
             if (player.connection != null) {
-                player.connection.send(packet);
+                player.connection.send(new ClientboundSetActionBarTextPacket(actionText));
             }
         }
     }
 
-    // Hauptmenü
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -315,28 +368,26 @@ public class ExampleMod implements ModInitializer {
 
                         ServerLevel sl = (ServerLevel) sp.level();
 
-                        if (slotId == 4) { // Challenge Controller (Clock / Torch / Repeater)
+                        if (slotId == 4) {
                             if (!isRunning) {
-                                isRunning = true;
-                                isPaused = false;
-                                sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet!")));
+                                startChallengeWithHost(sp);
                             } else {
                                 isPaused = !isPaused;
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 10) { // Wasser
+                        } else if (slotId == 10) {
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 12) { // Lava
+                        } else if (slotId == 12) {
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 14) { // Obsidian
+                        } else if (slotId == 14) {
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 16) { // Whitelist-Übersicht öffnen
+                        } else if (slotId == 16) {
                             openWhitelistMenu(sp);
-                        } else if (slotId == 22) { // Nachrichten Toggle (Name Tag)
+                        } else if (slotId == 22) {
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -350,15 +401,14 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        // Slot 4: Neuer Controller (Uhr, Fackel, Repeater)
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
             ctrlItem.set(DataComponents.CUSTOM_NAME, Component.literal("§a§lChallenge starten"));
             ctrlItem.set(DataComponents.LORE, new ItemLore(List.of(
-                Component.literal("§7Status: §cNicht aktiv"),
+                Component.literal("§7Nimmt den Block unter dem Host"),
                 Component.literal(""),
-                Component.literal("§8» §eKlick: Startet Timer & Block-Erkennung!")
+                Component.literal("§8» §eKlick: Challenge & Timer starten!")
             )));
         } else if (isPaused) {
             ctrlItem = new ItemStack(Items.REPEATER);
@@ -379,29 +429,26 @@ public class ExampleMod implements ModInitializer {
         }
         container.setItem(4, ctrlItem);
 
-        // Slot 10: Wasser
         boolean waterOk = WHITELIST.contains(Blocks.WATER);
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
         waterItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (waterOk ? "§cWellen-Despawn starten & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn allen Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
         container.setItem(10, waterItem);
 
-        // Slot 12: Lava
         boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
         ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
         lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
         lavaItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt")),
             Component.literal(""),
-            Component.literal("§8» §eKlick: " + (lavaOk ? "§cWellen-Despawn starten & verbannen" : "§aWieder zur Whitelist hinzufügen"))
+            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn allen Chunks löschen & verbannen" : "§aWieder zur Whitelist hinzufügen"))
         )));
         container.setItem(12, lavaItem);
 
-        // Slot 14: Obsidian
         boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
         ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
         obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
@@ -412,17 +459,15 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(14, obsItem);
 
-        // Slot 16: Whitelist GUI öffnen
         ItemStack bookItem = new ItemStack(Items.BOOK);
         bookItem.set(DataComponents.CUSTOM_NAME, Component.literal("§d§lWhitelist Übersicht"));
         bookItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Aktuell geschützt: §e" + WHITELIST.size() + " Blöcke"),
             Component.literal(""),
-            Component.literal("§8» §eKlick: Liste ansehen & Blöcke per Klick entfernen!")
+            Component.literal("§8» §eKlick: Blöcke ansehen & per Klick entfernen")
         )));
         container.setItem(16, bookItem);
 
-        // Slot 22: Nachrichten (Nametag statt Smaragdblock)
         ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -433,7 +478,6 @@ public class ExampleMod implements ModInitializer {
         container.setItem(22, msgItem);
     }
 
-    // Whitelist-Verwaltungs-Menü
     private static void openWhitelistMenu(ServerPlayer player) {
         player.openMenu(new SimpleMenuProvider((syncId, playerInv, p) -> {
             SimpleContainer container = new SimpleContainer(27);
@@ -449,7 +493,7 @@ public class ExampleMod implements ModInitializer {
                 it.set(DataComponents.LORE, new ItemLore(List.of(
                     Component.literal("§7Dieser Block ist geschützt."),
                     Component.literal(""),
-                    Component.literal("§8» §cKlick: Von der Whitelist entfernen!")
+                    Component.literal("§8» §cKlick: Von Whitelist entfernen!")
                 )));
                 container.setItem(i, it);
             }
@@ -474,7 +518,7 @@ public class ExampleMod implements ModInitializer {
                             Block removeBlock = list.get(slotId);
                             WHITELIST.remove(removeBlock);
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + removeBlock.getName().getString() + " §7von der Whitelist entfernt!")));
-                            openWhitelistMenu(sp); // Ansicht aktualisieren
+                            openWhitelistMenu(sp);
                         }
                         return;
                     }
@@ -488,7 +532,7 @@ public class ExampleMod implements ModInitializer {
         if (WHITELIST.contains(Blocks.WATER)) {
             WHITELIST.remove(Blocks.WATER);
             BANNED_BLOCKS.add(Blocks.WATER);
-            startRadialPurge(level, player.chunkPosition(), Blocks.WATER, 14);
+            startFastRadialPurge(level, player.chunkPosition(), Blocks.WATER, 16);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt — Despawn-Welle gestartet!")));
         } else {
             WHITELIST.add(Blocks.WATER);
@@ -501,7 +545,7 @@ public class ExampleMod implements ModInitializer {
         if (WHITELIST.contains(Blocks.LAVA)) {
             WHITELIST.remove(Blocks.LAVA);
             BANNED_BLOCKS.add(Blocks.LAVA);
-            startRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 14);
+            startFastRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 16);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt — Despawn-Welle gestartet!")));
         } else {
             WHITELIST.add(Blocks.LAVA);
@@ -517,26 +561,29 @@ public class ExampleMod implements ModInitializer {
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
-            if (block.equals(currentSharedBlock)) {
-                currentSharedBlock = null;
-            }
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + block.getName().getString() + " ist nun geschützt!")));
         }
     }
 
-    // Radiale Sortierung: Chunks von innen nach außen bereinigen
-    private static void startRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
+    // Schnelle Schockwelle (Nahbereich sofort, Ferne mit 16 Chunks/Tick)
+    private static void startFastRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
         List<ChunkPos> chunks = new ArrayList<>();
 
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
                 if (dx * dx + dz * dz <= radius * radius) {
-                    chunks.add(new ChunkPos(center.x() + dx, center.z() + dz));
+                    ChunkPos cp = new ChunkPos(center.x() + dx, center.z() + dz);
+                    // Nahbereich (Radius <= 2 Chunks) direkt in diesem Tick löschen
+                    if (Math.abs(dx) <= 2 && Math.abs(dz) <= 2) {
+                        LevelChunk c = level.getChunkSource().getChunk(cp.x(), cp.z(), false);
+                        if (c != null) clearChunkDirect(level, c, targetBlock);
+                    } else {
+                        chunks.add(cp);
+                    }
                 }
             }
         }
 
-        // Sortieren nach Distanz zum Spieler (nächste Chunks zuerst)
         chunks.sort(Comparator.comparingInt(cp -> {
             int ox = cp.x() - center.x();
             int oz = cp.z() - center.z();
@@ -549,7 +596,6 @@ public class ExampleMod implements ModInitializer {
         purgeLevel = level;
     }
 
-    // Palette-Filter: Überspringt leere Subchunks ohne Rechenlast
     private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
         LevelChunkSection[] sections = chunk.getSections();
         if (sections == null) return;
