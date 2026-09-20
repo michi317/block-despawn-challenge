@@ -207,8 +207,8 @@ public class ExampleMod implements ModInitializer {
 
             // Vanilla-Todesnachrichten dauerhaft unterdrücken & UHC durchsetzen
             if (server.getTickCount() % 40 == 0) {
-                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule showDeathMessages false");
-                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule showDeathMessages false");
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule naturalRegeneration " + (!uhcMode));
             }
 
             // Geteilte Herzen synchronisieren
@@ -365,7 +365,6 @@ public class ExampleMod implements ModInitializer {
             if (hp < last) {
                 damageOccurred = true;
             } else if (hp > last) {
-                // Bei UHC nur Heilung werten, wenn ein Potion-Effekt (Regeneration) vorliegt
                 if (!uhcMode || p.hasEffect(MobEffects.REGENERATION)) {
                     float diff = hp - last;
                     if (diff > healAmount) healAmount = diff;
@@ -394,7 +393,6 @@ public class ExampleMod implements ModInitializer {
                 }
             }
         } else {
-            // Verhindert unerlaubte natürliche Regeneration
             for (ServerPlayer p : players) {
                 if (p.isAlive() && p.getHealth() > currentSharedHealth) {
                     p.setHealth(currentSharedHealth);
@@ -427,8 +425,8 @@ public class ExampleMod implements ModInitializer {
         server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eGespielte Zeit: §a§l" + timeStr)), false);
         server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
 
-        // Weltweiter Wither-Todessound auf 100% Lautstärke für jeden Spieler
-        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "playsound minecraft:entity.wither.death master @a ~ ~ ~ 1000 0.8");
+        // Weltweiter Wither-Todessound an den Koordinaten jedes Spielers
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "execute as @a at @s run playsound minecraft:entity.wither.death master @s ~ ~ ~ 2 0.8");
 
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             p.setGameMode(GameType.SPECTATOR);
@@ -539,6 +537,7 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
+        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -654,7 +653,7 @@ public class ExampleMod implements ModInitializer {
     private static void toggleUhc(ServerLevel level, ServerPlayer player) {
         uhcMode = !uhcMode;
         var server = level.getServer();
-        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule naturalRegeneration " + (!uhcMode));
         server.getPlayerList().broadcastSystemMessage(
             Component.empty().append(PREFIX).append(Component.literal("§eUltra Hardcore (UHC) §7» " + 
                 (uhcMode ? "§aAktiviert" : "§cDeaktiviert"))),
