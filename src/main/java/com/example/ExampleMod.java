@@ -2,7 +2,6 @@ package com.example;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.commands.Commands;
@@ -54,13 +53,13 @@ public class ExampleMod implements ModInitializer {
     ));
 
     private static final Random RANDOM = new Random();
+    private int tickTimer = 0;
 
-    // RGB Hex-Gradient Generator
+    // RGB Hex-Farbverlauf Generator
     public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
         MutableComponent comp = Component.empty();
         int len = text.length();
-        if (len == 0) return comp;
-        if (len == 1) {
+        if (len <= 1) {
             return Component.literal(text).setStyle(Style.EMPTY.withColor(TextColor.fromRgb(startRgb)).withBold(bold));
         }
 
@@ -79,7 +78,7 @@ public class ExampleMod implements ModInitializer {
         return comp;
     }
 
-    // Modernes Präfix mit Hex-Farbverlauf (#FF3838 -> #FFA800)
+    // Modernes Präfix: Farbverlauf von Korallenrot (#FF3838) zu Sonnengold (#FFA800) ohne Klammern
     public static final Component PREFIX = Component.empty()
         .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
         .append(Component.literal(" §8» "));
@@ -122,14 +121,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 2. Chunks sofort beim Laden bereinigen (verhindert nachträgliche Lags & Fließen)
-        ServerChunkEvents.CHUNK_LOAD.register((serverLevel, chunk) -> {
-            if (!BANNED_BLOCKS.isEmpty()) {
-                clearChunkDirect(serverLevel, chunk, null);
-            }
-        });
-
-        // 3. Platzieren verbieten + Zisch-Effekt
+        // 2. Platzieren blockieren + Flammeneffekt
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -149,8 +141,10 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 4. Haupt-Tick Logik
+        // 3. Kontinuierlicher Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
+            tickTimer++;
+
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 if (player.onGround()) {
                     BlockPos underPos = new BlockPos(player.getBlockX(), player.getBlockY() - 1, player.getBlockZ());
@@ -181,8 +175,8 @@ public class ExampleMod implements ModInitializer {
                                 }
 
                                 if (player.level() instanceof ServerLevel serverLevel) {
-                                    // Angenehmer Sound statt Explosion
-                                    serverLevel.playSound(null, player.blockPosition(), SoundEvents.AMETHYST_BLOCK_RESONATE, SoundSource.BLOCKS, 0.7f, 1.0f);
+                                    // Angenehmer Amethyst-Resonanzklang statt lauter Explosion
+                                    serverLevel.playSound(null, player.blockPosition(), SoundEvents.AMETHYST_BLOCK_RESONATE, SoundSource.BLOCKS, 0.8f, 1.0f);
 
                                     // Block-Abbau-Partikel im Nahbereich um den Spieler
                                     BlockPos pPos = player.blockPosition();
@@ -204,6 +198,13 @@ public class ExampleMod implements ModInitializer {
                             currentSharedBlock = currentBlock;
                         }
                     }
+                }
+            }
+
+            // Regelmäßiger Flächencheck (alle 20 Ticks / 1 Sekunde)
+            if (tickTimer % 20 == 0 && !BANNED_BLOCKS.isEmpty()) {
+                for (ServerLevel level : server.getAllLevels()) {
+                    purgeBlockFromLoadedChunks(level, null);
                 }
             }
         });
@@ -299,7 +300,7 @@ public class ExampleMod implements ModInitializer {
             WHITELIST.remove(Blocks.WATER);
             BANNED_BLOCKS.add(Blocks.WATER);
             purgeBlockFromLoadedChunks(level, Blocks.WATER);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen Chunks verdampft!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen 16 Chunks verdampft!")));
         } else {
             WHITELIST.add(Blocks.WATER);
             BANNED_BLOCKS.remove(Blocks.WATER);
@@ -312,7 +313,7 @@ public class ExampleMod implements ModInitializer {
             WHITELIST.remove(Blocks.LAVA);
             BANNED_BLOCKS.add(Blocks.LAVA);
             purgeBlockFromLoadedChunks(level, Blocks.LAVA);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt und in allen Chunks gelöscht!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt und in allen 16 Chunks gelöscht!")));
         } else {
             WHITELIST.add(Blocks.LAVA);
             BANNED_BLOCKS.remove(Blocks.LAVA);
@@ -331,18 +332,23 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Scannt alle geladenen Chunks in 16 Chunks Umkreis um jeden Spieler
+    // Scannt alle Chunks im Radius von 16 Chunks um jeden Spieler
     private static void purgeBlockFromLoadedChunks(ServerLevel level, Block targetBlock) {
         Set<ChunkPos> checked = new HashSet<>();
         int chunkRadius = 16;
 
         for (ServerPlayer player : level.players()) {
-            ChunkPos center = player.chunkPosition();
+            int centerX = player.chunkPosition().x();
+            int centerZ = player.chunkPosition().z();
+
             for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
                 for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
-                    ChunkPos cPos = new ChunkPos(center.x + dx, center.z + dz);
+                    int targetX = centerX + dx;
+                    int targetZ = centerZ + dz;
+                    ChunkPos cPos = new ChunkPos(targetX, targetZ);
+
                     if (checked.add(cPos)) {
-                        LevelChunk chunk = level.getChunkSource().getChunk(cPos.x, cPos.z, false);
+                        LevelChunk chunk = level.getChunkSource().getChunk(targetX, targetZ, false);
                         if (chunk != null) {
                             clearChunkDirect(level, chunk, targetBlock);
                         }
@@ -352,7 +358,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Bereinigt einen Chunk über die gesamte Welthöhe ohne Sand-/Gravel-Physik
+    // Bereinigt Chunks ohne Block-Updates (Gravel/Sand bleibt frei in der Luft schweben)
     private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
         LevelChunkSection[] sections = chunk.getSections();
         if (sections == null) return;
@@ -379,7 +385,7 @@ public class ExampleMod implements ModInitializer {
                         if (shouldDelete) {
                             int worldY = sectionBottomY + y;
                             mPos.set(startX + x, worldY, startZ + z);
-                            // 2 = An Client senden | 16 = Drops unterdrücken (KEIN 1, daher KEIN Block-Update an Nachbarn)
+                            // Flag 2 = Client rendert Luft | Flag 16 = Drops unterdrücken (KEIN Flag 1 -> kein Gravitations-Update für Gravel)
                             level.setBlock(mPos, Blocks.AIR.defaultBlockState(), 2 | 16);
                         }
                     }
