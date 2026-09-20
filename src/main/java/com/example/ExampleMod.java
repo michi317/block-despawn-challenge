@@ -52,6 +52,7 @@ public class ExampleMod implements ModInitializer {
 
     // Modifier
     public static boolean sharedHearts = false;
+    private static boolean syncingHealth = false;
     public static boolean uhcMode = false;
     public static boolean waterAllowed = true;
     public static boolean lavaAllowed = true;
@@ -178,7 +179,6 @@ public class ExampleMod implements ModInitializer {
                         serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 18, 0.25, 0.25, 0.25, 0.05);
                         serverLevel.sendParticles(ParticleTypes.SMOKE, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 10, 0.2, 0.2, 0.2, 0.02);
 
-                        // Nur melden, wenn Chat-Meldungen aktiv sind
                         if (showBroadcasts) {
                             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + blockItem.getBlock().getName().getString() + " §cist verbrannt!")));
                         }
@@ -211,13 +211,12 @@ public class ExampleMod implements ModInitializer {
                 }
             }
 
-            // Geteilte Herzen laufen IMMER, wenn aktiviert (auch vor dem Start zum Testen)
+            // Geteilte Herzen laufen immer, wenn aktiviert
             if (sharedHearts && !syncingHealth) {
                 handleSharedHeartsDelta(server);
             }
 
             if (isRunning) {
-                // Prüfung auf Spielertod
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                     if (player.isDeadOrDying() || player.getHealth() <= 0.0f) {
                         triggerGameOver(server, player);
@@ -240,7 +239,7 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Flüssige Schockwelle: Maximal 3 Chunks pro Tick (absolut laggfrei)
+            // Flüssige Schockwelle: Maximal 3 Chunks pro Tick
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
                 for (int i = 0; i < 3 && !PURGE_QUEUE.isEmpty(); i++) {
                     ChunkPos cp = PURGE_QUEUE.poll();
@@ -288,7 +287,6 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    // Schockwelle bis 20 Chunks starten
                                     startSmoothRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 20);
                                 }
                             }
@@ -300,7 +298,6 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Präzise Delta-Synchronisierung für geteilte Herzen
     private static void handleSharedHeartsDelta(net.minecraft.server.MinecraftServer server) {
         List<ServerPlayer> players = server.getPlayerList().getPlayers();
         if (players.size() < 2) {
@@ -351,7 +348,6 @@ public class ExampleMod implements ModInitializer {
         syncingHealth = false;
     }
 
-    // Banner bei Spielertod mit Wither-Sound
     private static void triggerGameOver(net.minecraft.server.MinecraftServer server, ServerPlayer deadPlayer) {
         isRunning = false;
         isPaused = false;
@@ -372,7 +368,6 @@ public class ExampleMod implements ModInitializer {
 
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             if (p.level() instanceof ServerLevel sl) {
-                // Lauter, unüberhörbarer Wither-Todessound
                 sl.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.WITHER_DEATH, SoundSource.MASTER, 2.0f, 0.8f);
             }
             p.setGameMode(GameType.SPECTATOR);
@@ -436,7 +431,6 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Menü: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -698,9 +692,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Laggfreie Schockwelle: Nur 1 Chunk sofort, der Rest sanft über die Queue
     private static void startSmoothRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
-        // Sofort nur den Chunk direkt unter den Füßen leeren (0 Verzögerung im Nahbereich)
         LevelChunk centerChunk = level.getChunkSource().getChunk(center.x(), center.z(), false);
         if (centerChunk != null) {
             clearChunkDirect(level, centerChunk, targetBlock);
