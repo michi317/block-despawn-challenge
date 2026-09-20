@@ -2,12 +2,17 @@ package com.example;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.network.chat.Style;
+import net.minecraft.network.chat.TextColor;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundEvents;
@@ -23,10 +28,13 @@ import net.minecraft.world.inventory.MenuType;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
-import net.minecraft.world.level.Level;
+import net.minecraft.world.item.component.ItemLore;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 
 import java.util.*;
 
@@ -45,55 +53,52 @@ public class ExampleMod implements ModInitializer {
         Blocks.LAVA
     ));
 
-    private int tickTimer = 0;
     private static final Random RANDOM = new Random();
+
+    // RGB Hex-Gradient Generator
+    public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
+        MutableComponent comp = Component.empty();
+        int len = text.length();
+        if (len == 0) return comp;
+        if (len == 1) {
+            return Component.literal(text).setStyle(Style.EMPTY.withColor(TextColor.fromRgb(startRgb)).withBold(bold));
+        }
+
+        int r1 = (startRgb >> 16) & 0xFF, g1 = (startRgb >> 8) & 0xFF, b1 = startRgb & 0xFF;
+        int r2 = (endRgb >> 16) & 0xFF, g2 = (endRgb >> 8) & 0xFF, b2 = endRgb & 0xFF;
+
+        for (int i = 0; i < len; i++) {
+            float ratio = (float) i / (float) (len - 1);
+            int r = (int) (r1 + ratio * (r2 - r1));
+            int g = (int) (g1 + ratio * (g2 - g1));
+            int b = (int) (b1 + ratio * (b2 - b1));
+            int rgb = (r << 16) | (g << 8) | b;
+            comp.append(Component.literal(String.valueOf(text.charAt(i)))
+                    .setStyle(Style.EMPTY.withColor(TextColor.fromRgb(rgb)).withBold(bold)));
+        }
+        return comp;
+    }
+
+    // Modernes Präfix mit Hex-Farbverlauf (#FF3838 -> #FFA800)
+    public static final Component PREFIX = Component.empty()
+        .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
+        .append(Component.literal(" §8» "));
 
     @Override
     public void onInitialize() {
-        // Befehle registrieren
+        // 1. Befehle registrieren (/challenge öffnet direkt das Menü)
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
-                // /challenge (Info)
                 .executes(context -> {
-                    var src = context.getSource();
-                    src.sendSuccess(() -> Component.literal("§8§m--------------------------------"), false);
-                    src.sendSuccess(() -> Component.literal("§8[§6Challenge§8] §eStatus-Übersicht"), false);
-                    String current = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Keiner";
-                    src.sendSuccess(() -> Component.literal("§8» §7Aktueller Block: §a" + current), false);
-                    src.sendSuccess(() -> Component.literal("§8» §7Verbannte Blöcke: §c" + BANNED_BLOCKS.size()), false);
-                    src.sendSuccess(() -> Component.literal("§8» §7Wasserstatus: " + (WHITELIST.contains(Blocks.WATER) ? "§aErlaubt" : "§cVerbannt/Gelöscht")), false);
-                    src.sendSuccess(() -> Component.literal("§8» §7Nachrichten: " + (showBroadcasts ? "§aAktiviert" : "§cStumm")), false);
-                    src.sendSuccess(() -> Component.literal("§8§m--------------------------------"), false);
+                    ServerPlayer player = context.getSource().getPlayer();
+                    if (player != null) openChallengeMenu(player);
                     return 1;
                 })
-                // /challenge menu (Interaktives Klick-Menü)
                 .then(Commands.literal("menu").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
-                    if (player == null) return 0;
-                    openChallengeMenu(player);
+                    if (player != null) openChallengeMenu(player);
                     return 1;
                 }))
-                // /challenge water (Schnellbefehl)
-                .then(Commands.literal("water").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null) toggleWater((ServerLevel) player.level(), player);
-                    return 1;
-                }))
-                // /challenge lava (Schnellbefehl)
-                .then(Commands.literal("lava").executes(context -> {
-                    ServerPlayer player = context.getSource().getPlayer();
-                    if (player != null) toggleLava((ServerLevel) player.level(), player);
-                    return 1;
-                }))
-                // /challenge messages (Broadcasts umschalten)
-                .then(Commands.literal("messages").executes(context -> {
-                    showBroadcasts = !showBroadcasts;
-                    context.getSource().sendSuccess(() -> Component.literal(
-                        "§8[§6Challenge§8] §8» §7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert")
-                    ), false);
-                    return 1;
-                }))
-                // /challenge whitelist (Item in der Hand schützen/entfernen)
                 .then(Commands.literal("whitelist").executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player == null) return 0;
@@ -103,35 +108,38 @@ public class ExampleMod implements ModInitializer {
                         Block b = blockItem.getBlock();
                         if (WHITELIST.contains(b)) {
                             WHITELIST.remove(b);
-                            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §c" + b.getName().getString() + " §7von Whitelist entfernt!"));
+                            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + b.getName().getString() + " §7von der Whitelist entfernt!")));
                         } else {
                             WHITELIST.add(b);
                             BANNED_BLOCKS.remove(b);
-                            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §a" + b.getName().getString() + " §7zur Whitelist hinzugefügt!"));
+                            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + b.getName().getString() + " §7zur Whitelist hinzugefügt!")));
                         }
                     } else {
-                        player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §cDu musst einen Block in der Hand halten!"));
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cHalte einen Block in der Hand!")));
                     }
                     return 1;
                 }))
             );
         });
 
-        // 1. Platzieren blockieren + Flammeneffekt
+        // 2. Chunks sofort beim Laden bereinigen (verhindert nachträgliche Lags & Fließen)
+        ServerChunkEvents.CHUNK_LOAD.register((serverLevel, chunk) -> {
+            if (!BANNED_BLOCKS.isEmpty()) {
+                clearChunkDirect(serverLevel, chunk, null);
+            }
+        });
+
+        // 3. Platzieren verbieten + Zisch-Effekt
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
                 if (BANNED_BLOCKS.contains(blockItem.getBlock())) {
                     if (level instanceof ServerLevel serverLevel) {
                         BlockPos targetPos = hitResult.getBlockPos().relative(hitResult.getDirection());
-
-                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 20, 0.25, 0.25, 0.25, 0.05);
-                        serverLevel.sendParticles(ParticleTypes.SMOKE, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 15, 0.2, 0.2, 0.2, 0.02);
-                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.8f, 1.2f);
-
-                        player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §cDu kannst verbanntes §e" + blockItem.getBlock().getName().getString() + " §cnicht platzieren!"));
+                        serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 12, 0.2, 0.2, 0.2, 0.05);
+                        serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.6f, 1.2f);
+                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + blockItem.getBlock().getName().getString() + " §7ist verbannt!")));
                     }
-
                     if (!player.isCreative()) {
                         stack.shrink(1);
                     }
@@ -141,18 +149,11 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 2. Kontinuierlicher Server-Tick
+        // 4. Haupt-Tick Logik
         ServerTickEvents.END_SERVER_TICK.register(server -> {
-            tickTimer++;
-
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                // Bodenprüfung (nur bei festem Stand, nicht beim Springen)
                 if (player.onGround()) {
-                    int px = player.getBlockX();
-                    int py = player.getBlockY();
-                    int pz = player.getBlockZ();
-
-                    BlockPos underPos = new BlockPos(px, py - 1, pz);
+                    BlockPos underPos = new BlockPos(player.getBlockX(), player.getBlockY() - 1, player.getBlockZ());
                     BlockState underState = player.level().getBlockState(underPos);
                     Block currentBlock = underState.getBlock();
 
@@ -161,7 +162,7 @@ public class ExampleMod implements ModInitializer {
                             currentSharedBlock = currentBlock;
                             if (showBroadcasts) {
                                 server.getPlayerList().broadcastSystemMessage(
-                                    Component.literal("§8[§6Challenge§8] §8» §aStartblock: §f" + currentBlock.getName().getString()),
+                                    Component.empty().append(PREFIX).append(Component.literal("§aStartblock: §f§l" + currentBlock.getName().getString())),
                                     false
                                 );
                             }
@@ -172,42 +173,35 @@ public class ExampleMod implements ModInitializer {
 
                                 if (showBroadcasts) {
                                     server.getPlayerList().broadcastSystemMessage(
-                                        Component.literal("§8[§6Challenge§8] §8» §e" + player.getName().getString() + 
-                                            " §7wechselte! §c" + oldBlock.getName().getString() + 
-                                            " §7ist verbannt §8» §aNeuer Block: " + currentBlock.getName().getString()),
+                                        Component.empty().append(PREFIX)
+                                            .append(Component.literal("§f" + player.getName().getString() + " §8» §a§l" + currentBlock.getName().getString()))
+                                            .append(Component.literal(" §8| §c§m" + oldBlock.getName().getString() + "§c verbannt!")),
                                         false
                                     );
                                 }
 
-                                // Großflächen-Despawn mit Partikeln & Screen-Shake
                                 if (player.level() instanceof ServerLevel serverLevel) {
-                                    clearAreaWithEffects(serverLevel, player.blockPosition(), oldBlock, 52);
-                                    // Schockwelle ohne Schaden für sanftes Kamera-Wackeln
-                                    serverLevel.explode(null, player.getX(), player.getY(), player.getZ(), 0.0F, Level.ExplosionInteraction.NONE);
+                                    // Angenehmer Sound statt Explosion
+                                    serverLevel.playSound(null, player.blockPosition(), SoundEvents.AMETHYST_BLOCK_RESONATE, SoundSource.BLOCKS, 0.7f, 1.0f);
+
+                                    // Block-Abbau-Partikel im Nahbereich um den Spieler
+                                    BlockPos pPos = player.blockPosition();
+                                    for (int dx = -6; dx <= 6; dx++) {
+                                        for (int dy = -4; dy <= 4; dy++) {
+                                            for (int dz = -6; dz <= 6; dz++) {
+                                                BlockPos nearPos = pPos.offset(dx, dy, dz);
+                                                if (oldBlock.equals(serverLevel.getBlockState(nearPos).getBlock()) && RANDOM.nextFloat() < 0.20f) {
+                                                    serverLevel.levelEvent(2001, nearPos, Block.getId(oldBlock.defaultBlockState()));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Sofortiger 16-Chunk-Sweep um alle Spieler
+                                    purgeBlockFromLoadedChunks(serverLevel, oldBlock);
                                 }
                             }
                             currentSharedBlock = currentBlock;
-                        }
-                    }
-                }
-
-                // Laufender Despawn-Radius (32 Blöcke horizontal) alle 6 Ticks
-                if (tickTimer % 6 == 0 && !BANNED_BLOCKS.isEmpty()) {
-                    int px = player.getBlockX();
-                    int py = player.getBlockY();
-                    int pz = player.getBlockZ();
-                    int hRadius = 32;
-                    int vRadius = 14;
-
-                    for (int x = -hRadius; x <= hRadius; x++) {
-                        for (int y = -vRadius; y <= vRadius; y++) {
-                            for (int z = -hRadius; z <= hRadius; z++) {
-                                BlockPos checkPos = new BlockPos(px + x, py + y, pz + z);
-                                BlockState state = player.level().getBlockState(checkPos);
-                                if (BANNED_BLOCKS.contains(state.getBlock())) {
-                                    player.level().setBlock(checkPos, Blocks.AIR.defaultBlockState(), 2);
-                                }
-                            }
                         }
                     }
                 }
@@ -215,8 +209,10 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Interaktives Kisten-Menü öffnen
+    // Interaktives Kisten-Menü mit Beschreibungen
     private static void openChallengeMenu(ServerPlayer player) {
+        Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
+
         player.openMenu(new SimpleMenuProvider((syncId, playerInv, p) -> {
             SimpleContainer container = new SimpleContainer(27);
             updateMenuIcons(container);
@@ -228,46 +224,86 @@ public class ExampleMod implements ModInitializer {
                         ServerPlayer sp = (ServerPlayer) clicker;
                         ServerLevel sl = (ServerLevel) sp.level();
 
-                        if (slotId == 11) { // Wasser Toggle & Purge
+                        if (slotId == 11) { // Wasser
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) { // Lava Toggle & Purge
+                        } else if (slotId == 13) { // Lava
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) { // Obsidian Toggle
+                        } else if (slotId == 15) { // Obsidian
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 22) { // Nachrichten Toggle
+                        } else if (slotId == 22) { // Nachrichten
                             showBroadcasts = !showBroadcasts;
-                            sp.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert")));
+                            sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
                         }
-                        return; // Klick abfangen, Items bleiben sicher im Menü
+                        return;
                     }
                     super.clicked(slotId, button, containerInput, clicker);
                 }
             };
-        }, Component.literal("§8» §6Challenge Menü")));
+        }, menuTitle));
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        container.setItem(11, new ItemStack(Items.WATER_BUCKET));
-        container.setItem(13, new ItemStack(Items.LAVA_BUCKET));
-        container.setItem(15, new ItemStack(Blocks.OBSIDIAN.asItem()));
-        // Smaragdblock = An / Redstoneblock = Aus
-        container.setItem(22, new ItemStack(showBroadcasts ? Blocks.EMERALD_BLOCK.asItem() : Blocks.REDSTONE_BLOCK.asItem()));
+        // Wasser
+        boolean waterOk = WHITELIST.contains(Blocks.WATER);
+        ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
+        waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
+        waterItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (waterOk ? "§a§lErlaubt" : "§c§lVerbannt & Gelöscht")),
+            Component.literal(""),
+            Component.literal("§8» §eKlick: " + (waterOk ? "§cIn 16 Chunks verdampfen & verbannen" : "§aWieder zur Whitelist hinzufügen")),
+            Component.literal("§8» §7Löscht Ozeane ohne fließendes Wasser & ohne Gravel-Fall!")
+        )));
+        container.setItem(11, waterItem);
+
+        // Lava
+        boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
+        ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
+        lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
+        lavaItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (lavaOk ? "§a§lErlaubt" : "§c§lVerbannt & Gelöscht")),
+            Component.literal(""),
+            Component.literal("§8» §eKlick: " + (lavaOk ? "§cIn 16 Chunks leeren & verbannen" : "§aWieder zur Whitelist hinzufügen")),
+            Component.literal("§8» §7Entfernt Lavaseen über die komplette Welthöhe.")
+        )));
+        container.setItem(13, lavaItem);
+
+        // Obsidian
+        boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
+        ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
+        obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
+        obsItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (obsOk ? "§a§lGeschützt" : "§c§lNicht geschützt")),
+            Component.literal(""),
+            Component.literal("§8» §eKlick: " + (obsOk ? "§cSchutz aufheben" : "§aSchutz aktivieren")),
+            Component.literal("§8» §7Verhindert das Löschen beim Portal-Bauen.")
+        )));
+        container.setItem(15, obsItem);
+
+        // Meldungen
+        ItemStack msgItem = new ItemStack(showBroadcasts ? Blocks.EMERALD_BLOCK.asItem() : Blocks.REDSTONE_BLOCK.asItem());
+        msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
+        msgItem.set(DataComponents.LORE, new ItemLore(List.of(
+            Component.literal("§7Status: " + (showBroadcasts ? "§aAktiviert" : "§cStumm")),
+            Component.literal(""),
+            Component.literal("§8» §eKlick: " + (showBroadcasts ? "§7Stummschalten" : "§7Aktivieren"))
+        )));
+        container.setItem(22, msgItem);
     }
 
     private static void toggleWater(ServerLevel level, ServerPlayer player) {
         if (WHITELIST.contains(Blocks.WATER)) {
             WHITELIST.remove(Blocks.WATER);
             BANNED_BLOCKS.add(Blocks.WATER);
-            purgeFluid(level, player.blockPosition(), Blocks.WATER, 64);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §cWasser wurde verbannt und in 64 Blöcken Umkreis verdampft!"));
+            purgeBlockFromLoadedChunks(level, Blocks.WATER);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cWasser verbannt und in allen Chunks verdampft!")));
         } else {
             WHITELIST.add(Blocks.WATER);
             BANNED_BLOCKS.remove(Blocks.WATER);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §aWasser ist nun wieder auf der Whitelist!"));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aWasser ist wieder auf der Whitelist!")));
         }
     }
 
@@ -275,38 +311,40 @@ public class ExampleMod implements ModInitializer {
         if (WHITELIST.contains(Blocks.LAVA)) {
             WHITELIST.remove(Blocks.LAVA);
             BANNED_BLOCKS.add(Blocks.LAVA);
-            purgeFluid(level, player.blockPosition(), Blocks.LAVA, 64);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §cLava wurde verbannt und in 64 Blöcken Umkreis gelöscht!"));
+            purgeBlockFromLoadedChunks(level, Blocks.LAVA);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§cLava verbannt und in allen Chunks gelöscht!")));
         } else {
             WHITELIST.add(Blocks.LAVA);
             BANNED_BLOCKS.remove(Blocks.LAVA);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §aLava ist nun wieder auf der Whitelist!"));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§aLava ist wieder auf der Whitelist!")));
         }
     }
 
     private static void toggleBlockWhitelist(Block block, ServerPlayer player) {
         if (WHITELIST.contains(block)) {
             WHITELIST.remove(block);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §c" + block.getName().getString() + " ist nicht mehr geschützt!"));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c" + block.getName().getString() + " ist nicht mehr geschützt!")));
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
-            player.sendSystemMessage(Component.literal("§8[§6Challenge§8] §8» §a" + block.getName().getString() + " ist nun geschützt!"));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§a" + block.getName().getString() + " ist nun geschützt!")));
         }
     }
 
-    // Flüssigkeiten großflächig verdampfen
-    private static void purgeFluid(ServerLevel level, BlockPos center, Block fluidBlock, int radius) {
-        int minY = Math.max(level.getMinY(), center.getY() - 30);
-        int maxY = Math.min(level.getMaxY(), center.getY() + 40);
+    // Scannt alle geladenen Chunks in 16 Chunks Umkreis um jeden Spieler
+    private static void purgeBlockFromLoadedChunks(ServerLevel level, Block targetBlock) {
+        Set<ChunkPos> checked = new HashSet<>();
+        int chunkRadius = 16;
 
-        for (int x = -radius; x <= radius; x++) {
-            for (int z = -radius; z <= radius; z++) {
-                if (x * x + z * z <= radius * radius) {
-                    for (int y = minY; y <= maxY; y++) {
-                        BlockPos pos = new BlockPos(center.getX() + x, y, center.getZ() + z);
-                        if (level.getBlockState(pos).is(fluidBlock)) {
-                            level.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
+        for (ServerPlayer player : level.players()) {
+            ChunkPos center = player.chunkPosition();
+            for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
+                for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
+                    ChunkPos cPos = new ChunkPos(center.x + dx, center.z + dz);
+                    if (checked.add(cPos)) {
+                        LevelChunk chunk = level.getChunkSource().getChunk(cPos.x, cPos.z, false);
+                        if (chunk != null) {
+                            clearChunkDirect(level, chunk, targetBlock);
                         }
                     }
                 }
@@ -314,23 +352,35 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Großflächen-Despawn mit Block-Abbau-Partikeln
-    private static void clearAreaWithEffects(ServerLevel level, BlockPos center, Block targetBlock, int radius) {
-        int minY = Math.max(level.getMinY(), center.getY() - 25);
-        int maxY = Math.min(level.getMaxY(), center.getY() + 35);
+    // Bereinigt einen Chunk über die gesamte Welthöhe ohne Sand-/Gravel-Physik
+    private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
+        LevelChunkSection[] sections = chunk.getSections();
+        if (sections == null) return;
 
-        for (int x = -radius; x <= radius; x++) {
-            for (int z = -radius; z <= radius; z++) {
-                if (x * x + z * z <= radius * radius) {
-                    for (int y = minY; y <= maxY; y++) {
-                        BlockPos pos = new BlockPos(center.getX() + x, y, center.getZ() + z);
-                        BlockState state = level.getBlockState(pos);
+        BlockPos.MutableBlockPos mPos = new BlockPos.MutableBlockPos();
+        int startX = chunk.getPos().getMinBlockX();
+        int startZ = chunk.getPos().getMinBlockZ();
+        int minSectionY = level.getMinSectionY();
 
-                        if (state.is(targetBlock)) {
-                            if (pos.closerThan(center, 14) && RANDOM.nextFloat() < 0.25f) {
-                                level.levelEvent(2001, pos, Block.getId(state));
-                            }
-                            level.setBlock(pos, Blocks.AIR.defaultBlockState(), 2);
+        for (int sIndex = 0; sIndex < sections.length; sIndex++) {
+            LevelChunkSection section = sections[sIndex];
+            if (section == null || section.hasOnlyAir()) continue;
+
+            int sectionBottomY = (minSectionY + sIndex) * 16;
+
+            for (int x = 0; x < 16; x++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int y = 0; y < 16; y++) {
+                        BlockState state = section.getBlockState(x, y, z);
+                        Block b = state.getBlock();
+
+                        boolean shouldDelete = (specificBlock != null) ? (b == specificBlock) : BANNED_BLOCKS.contains(b);
+
+                        if (shouldDelete) {
+                            int worldY = sectionBottomY + y;
+                            mPos.set(startX + x, worldY, startZ + z);
+                            // 2 = An Client senden | 16 = Drops unterdrücken (KEIN 1, daher KEIN Block-Update an Nachbarn)
+                            level.setBlock(mPos, Blocks.AIR.defaultBlockState(), 2 | 16);
                         }
                     }
                 }
