@@ -1,8 +1,10 @@
 package com.example;
 
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -14,13 +16,16 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 
-import java.util.*;
+import java.util.HashSet;
+import java.util.Set;
 
 public class ExampleMod implements ModInitializer {
+    // Verbotene Blöcke
     public static final Set<Block> BANNED_BLOCKS = new HashSet<>();
-    private static final Map<UUID, Block> LAST_BLOCKS = new HashMap<>();
+    // Der aktuell für die Gruppe aktive/sichere Block
+    public static Block currentSharedBlock = null;
 
-    // Ausnahmen: Obsidian und Flüssigkeiten/Luft triggern keinen Bann
+    // Geschützte Blöcke: Verursachen keinen Wechsel und werden nie verbannt
     private static final Set<Block> WHITELIST = Set.of(
         Blocks.OBSIDIAN,
         Blocks.AIR,
@@ -34,7 +39,22 @@ public class ExampleMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        // 1. Verhindern, dass verbotene Blöcke platziert werden
+        // Ingame-Befehl: /challenge
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
+            dispatcher.register(Commands.literal("challenge")
+                .executes(context -> {
+                    var source = context.getSource();
+                    source.sendSuccess(() -> Component.literal("§6=== Challenge Info ==="), false);
+                    String current = (currentSharedBlock != null) ? currentSharedBlock.getName().getString() : "Noch keiner";
+                    source.sendSuccess(() -> Component.literal("§eAktueller Block: §a" + current), false);
+                    source.sendSuccess(() -> Component.literal("§eWhitelist (Sicher): §bObsidian, Wasser, Lava"), false);
+                    source.sendSuccess(() -> Component.literal("§eVerbannte Blöcke: §c" + BANNED_BLOCKS.size()), false);
+                    return 1;
+                })
+            );
+        });
+
+        // 1. Platzieren von verbannten Blöcken abfangen
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -42,19 +62,19 @@ public class ExampleMod implements ModInitializer {
                     if (!level.isClientSide()) {
                         player.displayClientMessage(Component.literal("§cDieser Block ist bereits verbannt!"), true);
                     }
-                    stack.setCount(0);
+                    stack.setCount(0); // Block wird direkt vernichtet
                     return InteractionResult.FAIL;
                 }
             }
             return InteractionResult.PASS;
         });
 
-        // 2. Kontinuierliche Welt- und Inventarprüfung
+        // 2. Kontinuierlicher Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             tickTimer++;
 
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                // Inventar leeren, falls verbotene Blöcke darin liegen
+                // Inventare aller Spieler von verbannten Items bereinigen
                 for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
                     ItemStack stack = player.getInventory().getItem(i);
                     if (stack.getItem() instanceof BlockItem blockItem) {
@@ -64,43 +84,50 @@ public class ExampleMod implements ModInitializer {
                     }
                 }
 
-                int px = player.getBlockX();
-                int py = player.getBlockY();
-                int pz = player.getBlockZ();
-
-                // Untergrund prüfen, wenn der Spieler auf dem Boden steht
+                // Nur prüfen, wenn der Spieler wirklich fest auf dem Boden steht (nicht beim Springen)
                 if (player.onGround()) {
+                    int px = player.getBlockX();
+                    int py = player.getBlockY();
+                    int pz = player.getBlockZ();
+
                     BlockPos underPos = new BlockPos(px, py - 1, pz);
                     BlockState underState = player.level().getBlockState(underPos);
                     Block currentBlock = underState.getBlock();
 
                     if (!WHITELIST.contains(currentBlock) && !underState.isAir()) {
-                        Block lastBlock = LAST_BLOCKS.get(player.getUUID());
-
-                        if (lastBlock == null) {
-                            LAST_BLOCKS.put(player.getUUID(), currentBlock);
-                        } else if (!lastBlock.equals(currentBlock)) {
-                            if (!BANNED_BLOCKS.contains(lastBlock)) {
-                                BANNED_BLOCKS.add(lastBlock);
+                        if (currentSharedBlock == null) {
+                            // Erster Spawn-Block wird zum Startblock
+                            currentSharedBlock = currentBlock;
+                            server.getPlayerList().broadcastSystemMessage(
+                                Component.literal("§a[Challenge gestartet] §eStartblock ist: §f" + currentBlock.getName().getString()),
+                                false
+                            );
+                        } else if (!currentBlock.equals(currentSharedBlock)) {
+                            // Ein Spieler hat einen NEUEN Block betreten!
+                            Block oldBlock = currentSharedBlock;
+                            if (!BANNED_BLOCKS.contains(oldBlock)) {
+                                BANNED_BLOCKS.add(oldBlock);
                                 server.getPlayerList().broadcastSystemMessage(
-                                    Component.literal("§e[Challenge] §c" + lastBlock.getName().getString() + " ist nun für immer verbannt!"),
+                                    Component.literal("§c[Challenge] §e" + player.getName().getString() + " hat gewechselt! §c" 
+                                        + oldBlock.getName().getString() + " ist verbannt! §aNeuer Block: " + currentBlock.getName().getString()),
                                     false
                                 );
                             }
-                            LAST_BLOCKS.put(player.getUUID(), currentBlock);
+                            currentSharedBlock = currentBlock;
                         }
                     }
                 }
 
-                // Despawn-Radius um Spieler (alle 5 Ticks)
+                // Alle 5 Ticks: Verbannte Blöcke um alle Spieler despawnen
                 if (tickTimer % 5 == 0 && !BANNED_BLOCKS.isEmpty()) {
+                    BlockPos center = player.blockPosition();
                     int hRadius = 16;
                     int vRadius = 10;
 
                     for (int x = -hRadius; x <= hRadius; x++) {
                         for (int y = -vRadius; y <= vRadius; y++) {
                             for (int z = -hRadius; z <= hRadius; z++) {
-                                BlockPos checkPos = new BlockPos(px + x, py + y, pz + z);
+                                BlockPos checkPos = center.offset(x, y, z);
                                 BlockState state = player.level().getBlockState(checkPos);
                                 if (BANNED_BLOCKS.contains(state.getBlock())) {
                                     player.level().setBlock(checkPos, Blocks.AIR.defaultBlockState(), 3);
