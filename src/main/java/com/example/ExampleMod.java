@@ -33,7 +33,6 @@ import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -78,14 +77,37 @@ public class ExampleMod implements ModInitializer {
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
     private static final Map<UUID, Integer> LAST_FOOD_MAP = new HashMap<>();
     private static final Map<UUID, Float> LAST_SAT_MAP = new HashMap<>();
-    private static final Map<UUID, ChunkPos> LAST_PLAYER_CHUNK = new HashMap<>();
+    private static final Map<UUID, ChunkCoord> LAST_PLAYER_CHUNK = new HashMap<>();
 
     // Ultra-Performance Queue (Maximal 2 Chunks pro Tick)
     private static int banVersion = 0;
     private static final Map<String, Map<Long, Integer>> WORLD_CLEANED_CHUNKS = new HashMap<>();
-    private static final Queue<ChunkPos> CHUNK_PURGE_QUEUE = new LinkedList<>();
+    private static final Queue<ChunkCoord> CHUNK_PURGE_QUEUE = new LinkedList<>();
     private static final Set<Long> CHUNKS_IN_QUEUE = new HashSet<>();
     private static ServerLevel activeServerLevel = null;
+
+    // Eigene Hilfsklasse für Chunk-Koordinaten (vermeidet private Felder von Minecraft)
+    public static class ChunkCoord {
+        public final int x;
+        public final int z;
+
+        public ChunkCoord(int x, int z) {
+            this.x = x;
+            this.z = z;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ChunkCoord that)) return false;
+            return x == that.x && z == that.z;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(x, z);
+        }
+    }
 
     // Reflection-Felder für FoodData
     private static Field foodLevelField = null;
@@ -309,7 +331,7 @@ public class ExampleMod implements ModInitializer {
                 float actualHpLost = oldHp - player.getHealth();
 
                 if (actualHpLost <= 0.05f) {
-                    return; // Schaden wurde komplett von Rüstung/Absorption geschluckt
+                    return;
                 }
 
                 LAST_HEALTH_MAP.put(player.getUUID(), player.getHealth());
@@ -420,30 +442,29 @@ public class ExampleMod implements ModInitializer {
             // --- RADAR: Chunks um sich bewegende Spieler einreihen ---
             if (blockDeleteEnabled && !BANNED_BLOCKS.isEmpty()) {
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                    ChunkPos currentChunk = new ChunkPos(player.getBlockX() >> 4, player.getBlockZ() >> 4);
-                    ChunkPos lastChunk = LAST_PLAYER_CHUNK.put(player.getUUID(), currentChunk);
+                    int pChunkX = player.getBlockX() >> 4;
+                    int pChunkZ = player.getBlockZ() >> 4;
+                    ChunkCoord currentChunk = new ChunkCoord(pChunkX, pChunkZ);
+                    ChunkCoord lastChunk = LAST_PLAYER_CHUNK.put(player.getUUID(), currentChunk);
 
                     if (player.level() instanceof ServerLevel sl) {
                         activeServerLevel = sl;
-                        // Wenn der Spieler sich in einen neuen Chunk bewegt (z. B. Boot)
                         if (lastChunk == null || !lastChunk.equals(currentChunk)) {
                             queueChunksAround(sl, currentChunk.x, currentChunk.z, 22, true);
                         }
                     }
                 }
 
-                // Regelmäßig Chunks in 22 Chunks Umkreis sicherstellen
                 if (server.getTickCount() % 40 == 0 && activeServerLevel != null) {
                     for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                         queueChunksAround(activeServerLevel, player.getBlockX() >> 4, player.getBlockZ() >> 4, 22, false);
                     }
                 }
 
-                // --- ULTRA-PERFORMANCE VERARBEITUNG: MAXIMAL 2 CHUNKS PRO TICK ---
-                // 2 Chunks * 20 Ticks = 40 Chunks/Sekunde! 16x schneller als jedes Boot, aber 100% laggfrei.
+                // ULTRA-PERFORMANCE: Maximal 2 Chunks pro Tick = 40 Chunks/Sekunde laggfrei
                 int processed = 0;
                 while (processed < 2 && !CHUNK_PURGE_QUEUE.isEmpty() && activeServerLevel != null) {
-                    ChunkPos cp = CHUNK_PURGE_QUEUE.poll();
+                    ChunkCoord cp = CHUNK_PURGE_QUEUE.poll();
                     long key = chunkKey(cp.x, cp.z);
                     CHUNKS_IN_QUEUE.remove(key);
 
@@ -498,7 +519,6 @@ public class ExampleMod implements ModInitializer {
                                             }
                                         }
 
-                                        // Sofort Chunks unter den Spielern reinigen
                                         for (ServerPlayer p : serverLevel.players()) {
                                             int cx = p.getBlockX() >> 4;
                                             int cz = p.getBlockZ() >> 4;
@@ -519,12 +539,11 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Reiht Chunks nach Distanz sortiert in die Queue ein
     private static void queueChunksAround(ServerLevel level, int centerX, int centerZ, int radius, boolean prioritizeClose) {
         String worldKey = level.dimension().toString();
         Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
 
-        List<ChunkPos> toAdd = new ArrayList<>();
+        List<ChunkCoord> toAdd = new ArrayList<>();
         int maxR = prioritizeClose ? Math.min(radius, 6) : radius;
 
         for (int dx = -maxR; dx <= maxR; dx++) {
@@ -536,7 +555,7 @@ public class ExampleMod implements ModInitializer {
 
                     if (cleanedMap.getOrDefault(key, -1) != banVersion && !CHUNKS_IN_QUEUE.contains(key)) {
                         CHUNKS_IN_QUEUE.add(key);
-                        toAdd.add(new ChunkPos(cx, cz));
+                        toAdd.add(new ChunkCoord(cx, cz));
                     }
                 }
             }
@@ -848,6 +867,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Menü-Layout: Links Welt (10, 11, 12) | Mitte Schalter (13) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
