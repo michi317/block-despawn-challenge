@@ -30,6 +30,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -60,7 +61,7 @@ public class ExampleMod implements ModInitializer {
     // Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
 
-    // Schnelle Schockwelle
+    // Performance Schockwellen-Queue (Time-Budget gesteuert)
     private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
     private static Block purgeTargetBlock = null;
     private static ServerLevel purgeLevel = null;
@@ -68,9 +69,10 @@ public class ExampleMod implements ModInitializer {
     // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
 
-    // Reines Block-Whitelist-System (nur solide Blöcke, standardmäßig Obsidian)
+    // Standard-Whitelist: Obsidian und Endportal-Rahmen
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
-        Blocks.OBSIDIAN
+        Blocks.OBSIDIAN,
+        Blocks.END_PORTAL_FRAME
     ));
 
     private static final Random RANDOM = new Random();
@@ -107,7 +109,7 @@ public class ExampleMod implements ModInitializer {
 
     public static final Component PREFIX = Component.empty()
         .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
-        .append(Component.literal(" §8» "));
+        .append(Component.literal(" §7» "));
 
     @Override
     public void onInitialize() {
@@ -161,7 +163,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Ghost-Item freies Platzieren (sofortiges Verbrennen)
+        // 1. Platzieren verbotener Blöcke (sofortiges Verbrennen ohne Ghost-Items)
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -169,14 +171,15 @@ public class ExampleMod implements ModInitializer {
                     if (level instanceof ServerLevel serverLevel) {
                         BlockPos targetPos = hitResult.getBlockPos().relative(hitResult.getDirection());
 
-                        // Verbrenn-Effekte & Zischen
                         serverLevel.playSound(null, targetPos, SoundEvents.FIRE_EXTINGUISH, SoundSource.BLOCKS, 0.9f, 1.2f);
                         serverLevel.playSound(null, targetPos, SoundEvents.FIRECHARGE_USE, SoundSource.BLOCKS, 0.4f, 1.1f);
                         serverLevel.sendParticles(ParticleTypes.LAVA, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 6, 0.2, 0.2, 0.2, 0.05);
                         serverLevel.sendParticles(ParticleTypes.FLAME, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 18, 0.25, 0.25, 0.25, 0.05);
                         serverLevel.sendParticles(ParticleTypes.SMOKE, targetPos.getX() + 0.5, targetPos.getY() + 0.5, targetPos.getZ() + 0.5, 10, 0.2, 0.2, 0.2, 0.02);
 
-                        player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + blockItem.getBlock().getName().getString() + " §cist verbrannt!")));
+                        if (showBroadcasts) {
+                            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + blockItem.getBlock().getName().getString() + " §cist verbrannt!")));
+                        }
 
                         if (!player.isCreative()) {
                             stack.shrink(1);
@@ -186,8 +189,7 @@ public class ExampleMod implements ModInitializer {
                             }
                         }
                     }
-                    // SUCCESS signalisiert dem Client eine verbrauchte Aktion ohne Ghost-Block
-                    return InteractionResult.SUCCESS;
+                    return InteractionResult.CONSUME;
                 }
             }
             return InteractionResult.PASS;
@@ -199,15 +201,25 @@ public class ExampleMod implements ModInitializer {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
-            if (isRunning && !isPaused) {
-                timerTicks++;
-                if (timerTicks >= 20) {
-                    timerTicks = 0;
-                    timerSeconds++;
+            if (isRunning) {
+                // Todesprüfung: Stirbt ein Spieler, scheitert die Challenge
+                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                    if (player.isDeadOrDying() || player.getHealth() <= 0.0f) {
+                        triggerGameOver(server, player);
+                        break;
+                    }
                 }
 
-                if (sharedHearts && !syncingHealth) {
-                    handleSharedHearts(server);
+                if (!isPaused) {
+                    timerTicks++;
+                    if (timerTicks >= 20) {
+                        timerTicks = 0;
+                        timerSeconds++;
+                    }
+
+                    if (sharedHearts && !syncingHealth) {
+                        handleSharedHearts(server);
+                    }
                 }
             }
 
@@ -217,9 +229,10 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Schnelle 16-Chunks/Tick Schockwelle
+            // Laggfreie Schockwelle mit strengem 4ms Zeitbudget pro Tick
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
-                for (int i = 0; i < 16 && !PURGE_QUEUE.isEmpty(); i++) {
+                long deadline = System.currentTimeMillis() + 4;
+                while (!PURGE_QUEUE.isEmpty() && System.currentTimeMillis() < deadline) {
                     ChunkPos cp = PURGE_QUEUE.poll();
                     LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
                     if (chunk != null) {
@@ -265,7 +278,8 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    startFastRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 16);
+                                    // 20 Chunks Radius von innen nach außen
+                                    startFastRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 20);
                                 }
                             }
                             PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
@@ -274,6 +288,32 @@ public class ExampleMod implements ModInitializer {
                 }
             }
         });
+    }
+
+    // Challenge fehlgeschlagen bei Spielertod
+    private static void triggerGameOver(net.minecraft.server.MinecraftServer server, ServerPlayer deadPlayer) {
+        isRunning = false;
+        isPaused = false;
+
+        int s = timerSeconds % 60;
+        int m = (timerSeconds / 60) % 60;
+        int h = timerSeconds / 3600;
+        String timeStr = (h > 0) ? String.format("%02d:%02d:%02d", h, m, s) : String.format("%02d:%02d", m, s);
+
+        Component deathMessage = deadPlayer.getCombatTracker().getDeathMessage();
+
+        server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
+        server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c§lCHALLENGE FEHLGESCHLAGEN!")), false);
+        server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eTodesfall: §f").append(deathMessage)), false);
+        server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eÜberlebte Zeit: §a§l" + timeStr)), false);
+        server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
+
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            if (p.level() instanceof ServerLevel sl) {
+                sl.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.RAID_HORN, SoundSource.PLAYERS, 1.5f, 0.7f);
+            }
+            p.setGameMode(GameType.SPECTATOR);
+        }
     }
 
     private static void handleSharedHearts(net.minecraft.server.MinecraftServer server) {
@@ -402,7 +442,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Sauberes Menü: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
+    // Menü: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -446,7 +486,7 @@ public class ExampleMod implements ModInitializer {
                             openWhitelistMenu(sp);
                         } else if (slotId == 22) { // Meldungen (Unten Mitte)
                             showBroadcasts = !showBroadcasts;
-                            sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§7Chat-Meldungen: " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
+                            sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eChat-Meldungen §7» " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
                         }
                         return;
@@ -573,12 +613,12 @@ public class ExampleMod implements ModInitializer {
             }
             syncingHealth = false;
             server.getPlayerList().broadcastSystemMessage(
-                Component.empty().append(PREFIX).append(Component.literal("§cGeteilte Herzen §8» §aAktiviert §7(Schaden wird synchronisiert)")),
+                Component.empty().append(PREFIX).append(Component.literal("§eGeteilte Herzen §7» §aAktiviert §f(Schaden wird synchronisiert)")),
                 false
             );
         } else {
             server.getPlayerList().broadcastSystemMessage(
-                Component.empty().append(PREFIX).append(Component.literal("§cGeteilte Herzen §8» §cDeaktiviert")),
+                Component.empty().append(PREFIX).append(Component.literal("§eGeteilte Herzen §7» §cDeaktiviert")),
                 false
             );
         }
@@ -589,8 +629,8 @@ public class ExampleMod implements ModInitializer {
         var server = level.getServer();
         server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule naturalRegeneration " + (!uhcMode));
         server.getPlayerList().broadcastSystemMessage(
-            Component.empty().append(PREFIX).append(Component.literal("§6Ultra Hardcore (UHC) §8» " + 
-                (uhcMode ? "§aAktiviert §7(Keine Essens-Regeneration)" : "§cDeaktiviert"))),
+            Component.empty().append(PREFIX).append(Component.literal("§eUltra Hardcore (UHC) §7» " + 
+                (uhcMode ? "§aAktiviert §f(Keine Essens-Regeneration)" : "§cDeaktiviert"))),
             false
         );
     }
@@ -646,11 +686,11 @@ public class ExampleMod implements ModInitializer {
         waterAllowed = !waterAllowed;
         if (!waterAllowed) {
             BANNED_BLOCKS.add(Blocks.WATER);
-            startFastRadialPurge(level, player.chunkPosition(), Blocks.WATER, 16);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§bWasser-System §8» §cIn allen Chunks gelöscht & verbannt!")));
+            startFastRadialPurge(level, player.chunkPosition(), Blocks.WATER, 20);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.WATER);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§bWasser-System §8» §aWieder erlaubt!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §aWieder erlaubt!")));
         }
     }
 
@@ -658,25 +698,26 @@ public class ExampleMod implements ModInitializer {
         lavaAllowed = !lavaAllowed;
         if (!lavaAllowed) {
             BANNED_BLOCKS.add(Blocks.LAVA);
-            startFastRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 16);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§6Lava-System §8» §cIn allen Chunks gelöscht & verbannt!")));
+            startFastRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 20);
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.LAVA);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§6Lava-System §8» §aWieder erlaubt!")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §aWieder erlaubt!")));
         }
     }
 
     private static void toggleBlockWhitelist(Block block, ServerPlayer player) {
         if (WHITELIST.contains(block)) {
             WHITELIST.remove(block);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§5Obsidian-Schutz §8» §cDeaktiviert")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + block.getName().getString() + " §7» §cSchutz aufgehoben")));
         } else {
             WHITELIST.add(block);
             BANNED_BLOCKS.remove(block);
-            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§5Obsidian-Schutz §8» §aAktiviert")));
+            player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§e" + block.getName().getString() + " §7» §aGeschützt")));
         }
     }
 
+    // Sammelt nur tatsächlich geladene Chunks bis Radius 20 und sortiert sie nach Spielernähe
     private static void startFastRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
         List<ChunkPos> chunks = new ArrayList<>();
 
@@ -684,10 +725,7 @@ public class ExampleMod implements ModInitializer {
             for (int dz = -radius; dz <= radius; dz++) {
                 if (dx * dx + dz * dz <= radius * radius) {
                     ChunkPos cp = new ChunkPos(center.x() + dx, center.z() + dz);
-                    if (Math.abs(dx) <= 2 && Math.abs(dz) <= 2) {
-                        LevelChunk c = level.getChunkSource().getChunk(cp.x(), cp.z(), false);
-                        if (c != null) clearChunkDirect(level, c, targetBlock);
-                    } else {
+                    if (level.getChunkSource().hasChunk(cp.x(), cp.z())) {
                         chunks.add(cp);
                     }
                 }
