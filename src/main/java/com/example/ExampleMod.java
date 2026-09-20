@@ -50,6 +50,9 @@ public class ExampleMod implements ModInitializer {
     private static int timerTicks = 0;
     private static int actionbarTicks = 0;
 
+    // Host-System: Speichert die UUID des Welt-Erstellers
+    public static final Set<UUID> HOSTS = new HashSet<>();
+
     private static final Map<UUID, ChunkPos> LAST_CHUNKS = new HashMap<>();
 
     public static final Set<Block> WHITELIST = new HashSet<>(Set.of(
@@ -63,18 +66,16 @@ public class ExampleMod implements ModInitializer {
 
     private static final Random RANDOM = new Random();
 
-    // Zuverlässige Prüfung: Host der Singleplayer-Welt oder Operator (OP)
+    // Prüft, ob der Spieler der Host der Welt ist
     public static boolean isHost(ServerPlayer player) {
-        if (player.createCommandSourceStack().hasPermission(2)) {
+        if (HOSTS.isEmpty()) {
+            HOSTS.add(player.getUUID());
             return true;
         }
-        if (player.level() instanceof ServerLevel serverLevel) {
-            return serverLevel.getServer().isSingleplayerOwner(player.getGameProfile());
-        }
-        return false;
+        return HOSTS.contains(player.getUUID());
     }
 
-    // Farbverlauf für Challenge-Präfix
+    // Farbverlauf für Challenge-Präfix (#FF3838 -> #FFA800)
     public static Component createGradient(String text, int startRgb, int endRgb, boolean bold) {
         MutableComponent comp = Component.empty();
         int len = text.length();
@@ -105,7 +106,7 @@ public class ExampleMod implements ModInitializer {
     public void onInitialize() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
-                // /challenge (Statusabfrage für jeden; Host öffnet Menü)
+                // /challenge (Host öffnet Menü, Mitspieler sehen Info)
                 .executes(context -> {
                     ServerPlayer player = context.getSource().getPlayer();
                     if (player != null && isHost(player)) {
@@ -207,8 +208,13 @@ public class ExampleMod implements ModInitializer {
             return InteractionResult.PASS;
         });
 
-        // 2. Kontinuierlicher Server-Tick
+        // 2. Server-Tick
         ServerTickEvents.END_SERVER_TICK.register(server -> {
+            // Host beim Betreten automatisch registrieren
+            if (HOSTS.isEmpty() && !server.getPlayerList().getPlayers().isEmpty()) {
+                HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
+            }
+
             if (isRunning && !isPaused) {
                 timerTicks++;
                 if (timerTicks >= 20) {
@@ -333,7 +339,7 @@ public class ExampleMod implements ModInitializer {
                 public void clicked(int slotId, int button, ContainerInput containerInput, Player clicker) {
                     if (slotId >= 0 && slotId < 27) {
                         ServerPlayer sp = (ServerPlayer) clicker;
-                        if (!isHost(sp)) return; // Klicks für Nicht-Hosts ignorieren
+                        if (!isHost(sp)) return; // Klicks von Nicht-Hosts abfangen
 
                         ServerLevel sl = (ServerLevel) sp.level();
 
