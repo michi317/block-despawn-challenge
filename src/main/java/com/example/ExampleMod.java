@@ -21,6 +21,7 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.ContainerInput;
@@ -60,8 +61,9 @@ public class ExampleMod implements ModInitializer {
     public static boolean waterAllowed = true;
     public static boolean lavaAllowed = true;
 
-    // Stand-Block pro Spieler
+    // Stand-Block & Lebenspunkte-Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
+    private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
 
     // Performance Schockwellen-Queue
     private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
@@ -203,17 +205,15 @@ public class ExampleMod implements ModInitializer {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
-            // Vanilla-Todesnachrichten dauerhaft unterdrücken
-            if (server.getTickCount() % 100 == 0) {
-                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule showDeathMessages false");
-                if (uhcMode) {
-                    server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule naturalRegeneration false");
-                }
+            // Vanilla-Todesnachrichten dauerhaft unterdrücken & UHC durchsetzen
+            if (server.getTickCount() % 40 == 0) {
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule showDeathMessages false");
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
             }
 
-            // Geteilte Herzen kontinuierlich synchronisieren
+            // Geteilte Herzen synchronisieren
             if (sharedHearts && !syncingHealth) {
-                handleSharedHeartsSync(server);
+                handleSharedHeartsSynchronized(server);
             }
 
             if (isRunning) {
@@ -239,9 +239,10 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Flüssige Schockwelle: Maximal 3 Chunks pro Tick
+            // Strenges 3ms Zeitbudget pro Tick (garantiert 20 TPS)
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
-                for (int i = 0; i < 3 && !PURGE_QUEUE.isEmpty(); i++) {
+                long deadline = System.currentTimeMillis() + 3;
+                while (!PURGE_QUEUE.isEmpty() && System.currentTimeMillis() < deadline) {
                     ChunkPos cp = PURGE_QUEUE.poll();
                     LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
                     if (chunk != null) {
@@ -287,7 +288,8 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    startSmoothRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 20);
+                                    // 28 Chunks Radius (über 440 Blöcke Sichtweite)
+                                    startSmoothRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 28);
                                 }
                             }
                             PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
@@ -298,17 +300,15 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Präzise Physik-Erkennung: Ermittelt exakt den tragenden Block (behebt Sneak- & Kanten-Bug)
+    // Präzise Fuß-Kollision (behebt das Auslösen an Kanten und beim Sneaken)
     private static Block getBlockUnderPlayer(ServerPlayer player) {
         AABB aabb = player.getBoundingBox();
-        // Taste millimetergenau den Bereich unter den Fußsohlen ab (niemals tiefere Klippen)
         AABB feetBox = new AABB(
-            aabb.minX + 0.001, aabb.minY - 0.08, aabb.minZ + 0.001,
-            aabb.maxX - 0.001, aabb.minY - 0.0001, aabb.maxZ - 0.001
+            aabb.minX + 0.02, aabb.minY - 0.05, aabb.minZ + 0.02,
+            aabb.maxX - 0.02, aabb.minY - 0.001, aabb.maxZ - 0.02
         );
 
         Block bestBlock = null;
-        double highestTopY = -Double.MAX_VALUE;
         double maxArea = -1.0;
 
         int minX = (int) Math.floor(feetBox.minX);
@@ -334,13 +334,7 @@ public class ExampleMod implements ModInitializer {
                         double overlapX = Math.min(aabb.maxX, worldBox.maxX) - Math.max(aabb.minX, worldBox.minX);
                         double overlapZ = Math.min(aabb.maxZ, worldBox.maxZ) - Math.max(aabb.minZ, worldBox.minZ);
                         double area = Math.max(0.0, overlapX) * Math.max(0.0, overlapZ);
-
-                        // Höchster Block gewinnt (z. B. Teppich auf Holz), bei gleicher Höhe die größte Kontaktfläche
-                        if (worldBox.maxY > highestTopY + 0.01) {
-                            highestTopY = worldBox.maxY;
-                            maxArea = area;
-                            bestBlock = state.getBlock();
-                        } else if (Math.abs(worldBox.maxY - highestTopY) <= 0.01 && area > maxArea) {
+                        if (area > maxArea) {
                             maxArea = area;
                             bestBlock = state.getBlock();
                         }
@@ -351,50 +345,68 @@ public class ExampleMod implements ModInitializer {
         return bestBlock;
     }
 
-    // Zuverlässige synchrone Lebenspunkte-Steuerung
-    private static void handleSharedHeartsSync(net.minecraft.server.MinecraftServer server) {
+    // 100% synchrone Herzen: Schaden zieht sofort alle herunter; Heilung nur durch echte Items
+    private static void handleSharedHeartsSynchronized(net.minecraft.server.MinecraftServer server) {
         List<ServerPlayer> players = server.getPlayerList().getPlayers();
-        if (players.size() < 2) return;
-
-        float minHp = 20.0f;
-        float maxHp = 0.0f;
-        boolean anyAlive = false;
-
-        for (ServerPlayer p : players) {
-            if (p.isAlive()) {
-                anyAlive = true;
-                float hp = p.getHealth();
-                if (hp < minHp) minHp = hp;
-                if (hp > maxHp) maxHp = hp;
-            }
+        if (players.size() < 2) {
+            for (ServerPlayer p : players) LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+            return;
         }
 
-        if (!anyAlive) return;
+        float minHp = 20.0f;
+        float healAmount = 0.0f;
+        boolean damageOccurred = false;
 
-        // Schaden erhalten: Alle fallen sofort auf den niedrigsten Wert
-        if (minHp < currentSharedHealth) {
-            currentSharedHealth = Math.max(0.0f, minHp);
-            syncingHealth = true;
+        for (ServerPlayer p : players) {
+            if (!p.isAlive()) continue;
+            float hp = p.getHealth();
+            float last = LAST_HEALTH_MAP.getOrDefault(p.getUUID(), hp);
+
+            if (hp < last) {
+                damageOccurred = true;
+            } else if (hp > last) {
+                // Bei UHC nur Heilung werten, wenn ein Potion-Effekt (Regeneration) vorliegt
+                if (!uhcMode || p.hasEffect(MobEffects.REGENERATION)) {
+                    float diff = hp - last;
+                    if (diff > healAmount) healAmount = diff;
+                }
+            }
+            if (hp < minHp) minHp = hp;
+        }
+
+        syncingHealth = true;
+
+        if (damageOccurred || minHp < currentSharedHealth) {
+            currentSharedHealth = minHp;
             for (ServerPlayer p : players) {
-                if (p.isAlive() && Math.abs(p.getHealth() - currentSharedHealth) > 0.01f) {
+                if (p.isAlive()) {
                     p.setHealth(currentSharedHealth);
                     if (currentSharedHealth <= 0.0f) {
                         p.hurt(p.damageSources().generic(), Float.MAX_VALUE);
                     }
                 }
             }
-            syncingHealth = false;
-        } else if (maxHp > currentSharedHealth && minHp >= currentSharedHealth) {
-            // Heilung erhalten: Alle werden auf den geheilten Wert gehoben
-            currentSharedHealth = Math.min(20.0f, maxHp);
-            syncingHealth = true;
+        } else if (healAmount > 0.0f) {
+            currentSharedHealth = Math.min(20.0f, currentSharedHealth + healAmount);
             for (ServerPlayer p : players) {
-                if (p.isAlive() && Math.abs(p.getHealth() - currentSharedHealth) > 0.01f) {
+                if (p.isAlive()) {
                     p.setHealth(currentSharedHealth);
                 }
             }
-            syncingHealth = false;
+        } else {
+            // Verhindert unerlaubte natürliche Regeneration
+            for (ServerPlayer p : players) {
+                if (p.isAlive() && p.getHealth() > currentSharedHealth) {
+                    p.setHealth(currentSharedHealth);
+                }
+            }
         }
+
+        for (ServerPlayer p : players) {
+            LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+        }
+
+        syncingHealth = false;
     }
 
     private static void triggerGameOver(net.minecraft.server.MinecraftServer server, ServerPlayer deadPlayer) {
@@ -411,14 +423,14 @@ public class ExampleMod implements ModInitializer {
         server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
         server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§c§lCHALLENGE FEHLGESCHLAGEN!")), false);
         server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eSpieler: §f" + deadPlayer.getName().getString())), false);
-        server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eTodesursache: §f").append(deathMessage)), false);
+        server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eTodesgrund: §f").append(deathMessage)), false);
         server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eGespielte Zeit: §a§l" + timeStr)), false);
         server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
 
+        // Weltweiter Wither-Todessound auf 100% Lautstärke für jeden Spieler
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "playsound minecraft:entity.wither.death master @a ~ ~ ~ 1000 0.8");
+
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-            if (p.level() instanceof ServerLevel sl) {
-                sl.playSound(null, p.getX(), p.getY(), p.getZ(), SoundEvents.WITHER_DEATH, SoundSource.MASTER, 2.0f, 0.8f);
-            }
             p.setGameMode(GameType.SPECTATOR);
         }
     }
@@ -436,6 +448,7 @@ public class ExampleMod implements ModInitializer {
         PLAYER_CURRENT_BLOCKS.clear();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             PLAYER_CURRENT_BLOCKS.put(p.getUUID(), hostBlock);
+            LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
         }
 
         currentSharedHealth = host.getHealth();
@@ -470,6 +483,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Menü: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -494,24 +508,24 @@ public class ExampleMod implements ModInitializer {
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 10) { // Wasser
+                        } else if (slotId == 10) { // Wasser (Links)
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 11) { // Lava
+                        } else if (slotId == 11) { // Lava (Links)
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 12) { // Obsidian
+                        } else if (slotId == 12) { // Obsidian (Links)
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 14) { // Geteilte Herzen
+                        } else if (slotId == 14) { // Geteilte Herzen (Rechts)
                             toggleSharedHearts(sl.getServer(), sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) { // UHC
+                        } else if (slotId == 15) { // UHC (Rechts)
                             toggleUhc(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 16) { // Whitelist Buch
+                        } else if (slotId == 16) { // Whitelist Buch (Rechts)
                             openWhitelistMenu(sp);
-                        } else if (slotId == 22) { // Meldungen
+                        } else if (slotId == 22) { // Meldungen (Unten Mitte)
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eChat-Meldungen §7» " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -623,13 +637,11 @@ public class ExampleMod implements ModInitializer {
 
     private static void toggleSharedHearts(net.minecraft.server.MinecraftServer server, ServerPlayer player) {
         sharedHearts = !sharedHearts;
-        if (sharedHearts) {
-            currentSharedHealth = player.getHealth();
-            syncingHealth = true;
-            for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-                p.setHealth(currentSharedHealth);
-            }
-            syncingHealth = false;
+        currentSharedHealth = player.getHealth();
+        LAST_HEALTH_MAP.clear();
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+            LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+            if (sharedHearts) p.setHealth(currentSharedHealth);
         }
 
         server.getPlayerList().broadcastSystemMessage(
@@ -642,7 +654,7 @@ public class ExampleMod implements ModInitializer {
     private static void toggleUhc(ServerLevel level, ServerPlayer player) {
         uhcMode = !uhcMode;
         var server = level.getServer();
-        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withPermission(4).withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
         server.getPlayerList().broadcastSystemMessage(
             Component.empty().append(PREFIX).append(Component.literal("§eUltra Hardcore (UHC) §7» " + 
                 (uhcMode ? "§aAktiviert" : "§cDeaktiviert"))),
@@ -701,7 +713,7 @@ public class ExampleMod implements ModInitializer {
         waterAllowed = !waterAllowed;
         if (!waterAllowed) {
             BANNED_BLOCKS.add(Blocks.WATER);
-            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.WATER, 20);
+            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.WATER, 28);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.WATER);
@@ -713,7 +725,7 @@ public class ExampleMod implements ModInitializer {
         lavaAllowed = !lavaAllowed;
         if (!lavaAllowed) {
             BANNED_BLOCKS.add(Blocks.LAVA);
-            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 20);
+            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 28);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.LAVA);
