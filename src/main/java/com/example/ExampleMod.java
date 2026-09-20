@@ -43,6 +43,8 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.util.*;
 
 public class ExampleMod implements ModInitializer {
@@ -61,6 +63,12 @@ public class ExampleMod implements ModInitializer {
     public static boolean sharedHearts = false;
     public static float currentSharedHealth = 20.0f;
     private static boolean syncingHealth = false;
+
+    // Geteilter Hunger & Sättigung
+    public static int currentSharedFood = 20;
+    public static float currentSharedSaturation = 5.0f;
+    private static boolean syncingFood = false;
+
     public static boolean uhcMode = false;
     public static boolean waterAllowed = true;
     public static boolean lavaAllowed = true;
@@ -68,6 +76,14 @@ public class ExampleMod implements ModInitializer {
     // Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
+    private static final Map<UUID, Integer> LAST_FOOD_MAP = new HashMap<>();
+    private static final Map<UUID, Float> LAST_SAT_MAP = new HashMap<>();
+
+    // Reflection-Felder für FoodData
+    private static Field foodLevelField = null;
+    private static Field saturationField = null;
+    private static Field tickTimerField = null;
+    private static boolean foodFieldsInitialized = false;
 
     // Multi-Player Live-Radar
     private static int banVersion = 0;
@@ -84,7 +100,6 @@ public class ExampleMod implements ModInitializer {
 
     private static final Random RANDOM = new Random();
 
-    // Mapping-unabhängiger 64-Bit Chunk-Key
     public static long chunkKey(int x, int z) {
         return (((long) x) & 0xFFFFFFFFL) | ((((long) z) & 0xFFFFFFFFL) << 32);
     }
@@ -97,6 +112,49 @@ public class ExampleMod implements ModInitializer {
         return HOSTS.contains(player.getUUID());
     }
 
+    // Initialisiert die Reflection-Felder für FoodData versionsunabhängig
+    private static void initFoodFields(Object fd) {
+        if (foodFieldsInitialized) return;
+        foodFieldsInitialized = true;
+        try {
+            int intIdx = 0;
+            int floatIdx = 0;
+            for (Field f : fd.getClass().getDeclaredFields()) {
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                f.setAccessible(true);
+                if (f.getType() == int.class) {
+                    if (f.getName().toLowerCase().contains("food") || f.getName().equals("foodLevel")) {
+                        foodLevelField = f;
+                    } else if (f.getName().toLowerCase().contains("timer") || f.getName().equals("tickTimer")) {
+                        tickTimerField = f;
+                    } else if (intIdx == 0 && foodLevelField == null) {
+                        foodLevelField = f;
+                    } else if (intIdx == 1 && tickTimerField == null) {
+                        tickTimerField = f;
+                    }
+                    intIdx++;
+                } else if (f.getType() == float.class) {
+                    if (f.getName().toLowerCase().contains("sat") || f.getName().equals("saturationLevel")) {
+                        saturationField = f;
+                    } else if (floatIdx == 0 && saturationField == null) {
+                        saturationField = f;
+                    }
+                    floatIdx++;
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    // Setzt Hunger & Sättigung auf dem Spieler
+    public static void setPlayerFood(ServerPlayer player, int food, float sat) {
+        try {
+            Object fd = player.getFoodData();
+            initFoodFields(fd);
+            if (foodLevelField != null) foodLevelField.setInt(fd, food);
+            if (saturationField != null) saturationField.setFloat(fd, sat);
+        } catch (Exception ignored) {}
+    }
+
     public static void resetChallengeState() {
         BANNED_BLOCKS.clear();
         isRunning = false;
@@ -105,7 +163,10 @@ public class ExampleMod implements ModInitializer {
         timerTicks = 0;
         actionbarTicks = 0;
         currentSharedHealth = 20.0f;
+        currentSharedFood = 20;
+        currentSharedSaturation = 5.0f;
         syncingHealth = false;
+        syncingFood = false;
         blockDeleteEnabled = true;
         waterAllowed = true;
         lavaAllowed = true;
@@ -113,6 +174,8 @@ public class ExampleMod implements ModInitializer {
 
         PLAYER_CURRENT_BLOCKS.clear();
         LAST_HEALTH_MAP.clear();
+        LAST_FOOD_MAP.clear();
+        LAST_SAT_MAP.clear();
         WORLD_CLEANED_CHUNKS.clear();
         HOSTS.clear();
 
@@ -231,7 +294,7 @@ public class ExampleMod implements ModInitializer {
             return true;
         });
 
-        // 2. Schadensanzeige im Chat (Wer hat wie viel Schaden durch was bekommen)
+        // 2. Detaillierte Schadensanzeige im Chat
         ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, damageSource, baseDamageTaken, damageTaken, blocked) -> {
             if (!isRunning || isPaused || blocked || damageTaken <= 0.01f) return;
             if (entity instanceof ServerPlayer player) {
@@ -298,6 +361,18 @@ public class ExampleMod implements ModInitializer {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
+            // UHC-Schutz: Unterdrückt den internen Food-Regen-Timer komplett
+            if (uhcMode) {
+                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                    initFoodFields(player.getFoodData());
+                    if (tickTimerField != null) {
+                        try {
+                            tickTimerField.setInt(player.getFoodData(), 0);
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+
             // Gamerules synchronisieren & Command-Feedback stummschalten
             if (server.getTickCount() % 40 == 0) {
                 var source = server.createCommandSourceStack().withSuppressedOutput();
@@ -306,8 +381,10 @@ public class ExampleMod implements ModInitializer {
                 server.getCommands().performPrefixedCommand(source, "gamerule naturalRegeneration " + (!uhcMode));
             }
 
+            // Geteilte Herzen & geteilter Hunger synchronisieren
             if (sharedHearts && !syncingHealth) {
                 handleSharedHeartsSynchronized(server);
+                handleSharedFoodSynchronized(server);
             }
 
             if (isRunning && !isPaused) {
@@ -521,7 +598,7 @@ public class ExampleMod implements ModInitializer {
         return bestBlock;
     }
 
-    // Synchrone Herzen: Heilung nur über echte Items (Goldäpfel, Heiltränke, etc.)
+    // Synchrone Herzen
     private static void handleSharedHeartsSynchronized(net.minecraft.server.MinecraftServer server) {
         List<ServerPlayer> players = server.getPlayerList().getPlayers();
         if (players.size() < 2) {
@@ -578,6 +655,57 @@ public class ExampleMod implements ModInitializer {
         syncingHealth = false;
     }
 
+    // Synchronisation von Hungerkeulen & Sättigung
+    private static void handleSharedFoodSynchronized(net.minecraft.server.MinecraftServer server) {
+        if (syncingFood) return;
+        List<ServerPlayer> players = server.getPlayerList().getPlayers();
+        if (players.size() < 2) {
+            for (ServerPlayer p : players) {
+                LAST_FOOD_MAP.put(p.getUUID(), p.getFoodData().getFoodLevel());
+                LAST_SAT_MAP.put(p.getUUID(), p.getFoodData().getSaturationLevel());
+            }
+            return;
+        }
+
+        int foodDelta = 0;
+        float satDelta = 0.0f;
+
+        for (ServerPlayer p : players) {
+            int food = p.getFoodData().getFoodLevel();
+            float sat = p.getFoodData().getSaturationLevel();
+            int lastFood = LAST_FOOD_MAP.getOrDefault(p.getUUID(), food);
+            float lastSat = LAST_SAT_MAP.getOrDefault(p.getUUID(), sat);
+
+            if (food != lastFood) {
+                foodDelta += (food - lastFood);
+            }
+            if (Math.abs(sat - lastSat) > 0.01f) {
+                satDelta += (sat - lastSat);
+            }
+        }
+
+        if (foodDelta != 0 || Math.abs(satDelta) > 0.01f) {
+            currentSharedFood = Math.max(0, Math.min(20, currentSharedFood + foodDelta));
+            currentSharedSaturation = Math.max(0.0f, Math.min(20.0f, currentSharedSaturation + satDelta));
+
+            syncingFood = true;
+            for (ServerPlayer p : players) {
+                setPlayerFood(p, currentSharedFood, currentSharedSaturation);
+                LAST_FOOD_MAP.put(p.getUUID(), currentSharedFood);
+                LAST_SAT_MAP.put(p.getUUID(), currentSharedSaturation);
+            }
+            syncingFood = false;
+        } else {
+            for (ServerPlayer p : players) {
+                if (p.getFoodData().getFoodLevel() != currentSharedFood) {
+                    setPlayerFood(p, currentSharedFood, currentSharedSaturation);
+                }
+                LAST_FOOD_MAP.put(p.getUUID(), currentSharedFood);
+                LAST_SAT_MAP.put(p.getUUID(), currentSharedSaturation);
+            }
+        }
+    }
+
     private static void triggerGameOver(net.minecraft.server.MinecraftServer server, ServerPlayer deadPlayer, Component deathReason) {
         isRunning = false;
         isPaused = false;
@@ -613,6 +741,10 @@ public class ExampleMod implements ModInitializer {
         server.getCommands().performPrefixedCommand(source, "gamerule showDeathMessages false");
         server.getCommands().performPrefixedCommand(source, "gamerule sendCommandFeedback false");
 
+        currentSharedHealth = host.getHealth();
+        currentSharedFood = host.getFoodData().getFoodLevel();
+        currentSharedSaturation = host.getFoodData().getSaturationLevel();
+
         if (blockDeleteEnabled) {
             Block hostBlock = getBlockUnderPlayer(host);
             if (hostBlock == null || WHITELIST.contains(hostBlock)) {
@@ -623,9 +755,10 @@ public class ExampleMod implements ModInitializer {
             for (ServerPlayer p : server.getPlayerList().getPlayers()) {
                 PLAYER_CURRENT_BLOCKS.put(p.getUUID(), hostBlock);
                 LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+                LAST_FOOD_MAP.put(p.getUUID(), currentSharedFood);
+                LAST_SAT_MAP.put(p.getUUID(), currentSharedSaturation);
+                setPlayerFood(p, currentSharedFood, currentSharedSaturation);
             }
-
-            currentSharedHealth = host.getHealth();
 
             server.getPlayerList().broadcastSystemMessage(
                 Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7Startblock: §f§l" + hostBlock.getName().getString())),
@@ -634,8 +767,10 @@ public class ExampleMod implements ModInitializer {
         } else {
             for (ServerPlayer p : server.getPlayerList().getPlayers()) {
                 LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
+                LAST_FOOD_MAP.put(p.getUUID(), currentSharedFood);
+                LAST_SAT_MAP.put(p.getUUID(), currentSharedSaturation);
+                setPlayerFood(p, currentSharedFood, currentSharedSaturation);
             }
-            currentSharedHealth = host.getHealth();
 
             server.getPlayerList().broadcastSystemMessage(
                 Component.empty().append(PREFIX).append(Component.literal("§aChallenge gestartet! §7(Modifier-Modus ohne Block-Despawn)")),
@@ -672,6 +807,7 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
+    // Menü-Layout: Links Welt (10, 11, 12) | Mitte Schalter (13) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -731,6 +867,7 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
+        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -801,10 +938,11 @@ public class ExampleMod implements ModInitializer {
 
         // Rechte Seite: Modifier
         ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
-        heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen: AN" : "§7§lGeteilte Herzen: AUS"));
+        heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen & Hunger: AN" : "§7§lGeteilte Herzen & Hunger: AUS"));
         heartsItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (sharedHearts ? "§aAktiviert" : "§cDeaktiviert")),
             Component.literal(""),
+            Component.literal("§8» §7Herzen und Hungerkeulen werden synchronisiert."),
             Component.literal("§8» §eKlick: Umschalten")
         )));
         container.setItem(14, heartsItem);
@@ -814,6 +952,7 @@ public class ExampleMod implements ModInitializer {
         uhcItem.set(DataComponents.LORE, new ItemLore(List.of(
             Component.literal("§7Status: " + (uhcMode ? "§aAktiviert" : "§cDeaktiviert")),
             Component.literal(""),
+            Component.literal("§8» §7Keine natürliche Lebensregeneration durch Essen."),
             Component.literal("§8» §eKlick: Umschalten")
         )));
         container.setItem(15, uhcItem);
@@ -841,14 +980,25 @@ public class ExampleMod implements ModInitializer {
     private static void toggleSharedHearts(net.minecraft.server.MinecraftServer server, ServerPlayer player) {
         sharedHearts = !sharedHearts;
         currentSharedHealth = player.getHealth();
+        currentSharedFood = player.getFoodData().getFoodLevel();
+        currentSharedSaturation = player.getFoodData().getSaturationLevel();
+
         LAST_HEALTH_MAP.clear();
+        LAST_FOOD_MAP.clear();
+        LAST_SAT_MAP.clear();
+
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             LAST_HEALTH_MAP.put(p.getUUID(), p.getHealth());
-            if (sharedHearts) p.setHealth(currentSharedHealth);
+            LAST_FOOD_MAP.put(p.getUUID(), currentSharedFood);
+            LAST_SAT_MAP.put(p.getUUID(), currentSharedSaturation);
+            if (sharedHearts) {
+                p.setHealth(currentSharedHealth);
+                setPlayerFood(p, currentSharedFood, currentSharedSaturation);
+            }
         }
 
         server.getPlayerList().broadcastSystemMessage(
-            Component.empty().append(PREFIX).append(Component.literal("§eGeteilte Herzen §7» " + 
+            Component.empty().append(PREFIX).append(Component.literal("§eGeteilte Herzen & Hunger §7» " + 
                 (sharedHearts ? "§aAktiviert" : "§cDeaktiviert"))),
             false
         );
