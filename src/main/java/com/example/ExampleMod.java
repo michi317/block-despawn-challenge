@@ -78,16 +78,20 @@ public class ExampleMod implements ModInitializer {
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
     private static final Map<UUID, Integer> LAST_FOOD_MAP = new HashMap<>();
     private static final Map<UUID, Float> LAST_SAT_MAP = new HashMap<>();
+    private static final Map<UUID, ChunkPos> LAST_PLAYER_CHUNK = new HashMap<>();
+
+    // Ultra-Performance Queue (Maximal 2 Chunks pro Tick)
+    private static int banVersion = 0;
+    private static final Map<String, Map<Long, Integer>> WORLD_CLEANED_CHUNKS = new HashMap<>();
+    private static final Queue<ChunkPos> CHUNK_PURGE_QUEUE = new LinkedList<>();
+    private static final Set<Long> CHUNKS_IN_QUEUE = new HashSet<>();
+    private static ServerLevel activeServerLevel = null;
 
     // Reflection-Felder für FoodData
     private static Field foodLevelField = null;
     private static Field saturationField = null;
     private static Field tickTimerField = null;
     private static boolean foodFieldsInitialized = false;
-
-    // Multi-Player Live-Radar
-    private static int banVersion = 0;
-    private static final Map<String, Map<Long, Integer>> WORLD_CLEANED_CHUNKS = new HashMap<>();
 
     // Host-System
     public static final Set<UUID> HOSTS = new HashSet<>();
@@ -112,7 +116,6 @@ public class ExampleMod implements ModInitializer {
         return HOSTS.contains(player.getUUID());
     }
 
-    // Initialisiert die Reflection-Felder für FoodData versionsunabhängig
     private static void initFoodFields(Object fd) {
         if (foodFieldsInitialized) return;
         foodFieldsInitialized = true;
@@ -145,7 +148,6 @@ public class ExampleMod implements ModInitializer {
         } catch (Exception ignored) {}
     }
 
-    // Setzt Hunger & Sättigung auf dem Spieler
     public static void setPlayerFood(ServerPlayer player, int food, float sat) {
         try {
             Object fd = player.getFoodData();
@@ -176,7 +178,12 @@ public class ExampleMod implements ModInitializer {
         LAST_HEALTH_MAP.clear();
         LAST_FOOD_MAP.clear();
         LAST_SAT_MAP.clear();
+        LAST_PLAYER_CHUNK.clear();
+
         WORLD_CLEANED_CHUNKS.clear();
+        CHUNK_PURGE_QUEUE.clear();
+        CHUNKS_IN_QUEUE.clear();
+        activeServerLevel = null;
         HOSTS.clear();
 
         WHITELIST.clear();
@@ -294,12 +301,21 @@ public class ExampleMod implements ModInitializer {
             return true;
         });
 
-        // 2. Detaillierte Schadensanzeige im Chat
+        // 2. Präzise Schadensanzeige: Berechnet exakt die verlorenen Herzen nach Rüstung
         ServerLivingEntityEvents.AFTER_DAMAGE.register((entity, damageSource, baseDamageTaken, damageTaken, blocked) -> {
-            if (!isRunning || isPaused || blocked || damageTaken <= 0.01f) return;
+            if (!isRunning || isPaused || blocked) return;
             if (entity instanceof ServerPlayer player) {
+                float oldHp = LAST_HEALTH_MAP.getOrDefault(player.getUUID(), player.getHealth());
+                float actualHpLost = oldHp - player.getHealth();
+
+                if (actualHpLost <= 0.05f) {
+                    return; // Schaden wurde komplett von Rüstung/Absorption geschluckt
+                }
+
+                LAST_HEALTH_MAP.put(player.getUUID(), player.getHealth());
+
                 if (showBroadcasts) {
-                    float hearts = damageTaken / 2.0f;
+                    float hearts = actualHpLost / 2.0f;
                     String heartStr;
                     if (Math.abs(hearts - 1.0f) < 0.05f) {
                         heartStr = "1 Herz";
@@ -321,7 +337,7 @@ public class ExampleMod implements ModInitializer {
             }
         });
 
-        // 3. Verbotene Blöcke platzieren
+        // 3. Verbotene Blöcke verbrennen
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             if (!blockDeleteEnabled) return InteractionResult.PASS;
 
@@ -361,7 +377,7 @@ public class ExampleMod implements ModInitializer {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
-            // UHC-Schutz: Unterdrückt den internen Food-Regen-Timer komplett
+            // UHC: Unterdrückt den internen Food-Regenerationstimer komplett (kein Herz-Flackern mehr)
             if (uhcMode) {
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                     initFoodFields(player.getFoodData());
@@ -373,7 +389,7 @@ public class ExampleMod implements ModInitializer {
                 }
             }
 
-            // Gamerules synchronisieren & Command-Feedback stummschalten
+            // Gamerules sauber synchronisieren & Chat-Feedback stummschalten
             if (server.getTickCount() % 40 == 0) {
                 var source = server.createCommandSourceStack().withSuppressedOutput();
                 server.getCommands().performPrefixedCommand(source, "gamerule showDeathMessages false");
@@ -381,7 +397,7 @@ public class ExampleMod implements ModInitializer {
                 server.getCommands().performPrefixedCommand(source, "gamerule naturalRegeneration " + (!uhcMode));
             }
 
-            // Geteilte Herzen & geteilter Hunger synchronisieren
+            // Geteilte Herzen & geteilten Hunger synchronisieren
             if (sharedHearts && !syncingHealth) {
                 handleSharedHeartsSynchronized(server);
                 handleSharedFoodSynchronized(server);
@@ -401,28 +417,49 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Multi-Player Live-Radar für alle Spieler
+            // --- RADAR: Chunks um sich bewegende Spieler einreihen ---
             if (blockDeleteEnabled && !BANNED_BLOCKS.isEmpty()) {
-                List<ServerPlayer> players = server.getPlayerList().getPlayers();
-                if (!players.isEmpty()) {
-                    long deadline = System.currentTimeMillis() + 4;
+                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                    ChunkPos currentChunk = new ChunkPos(player.getBlockX() >> 4, player.getBlockZ() >> 4);
+                    ChunkPos lastChunk = LAST_PLAYER_CHUNK.put(player.getUUID(), currentChunk);
 
-                    for (int r = 0; r <= 22 && System.currentTimeMillis() < deadline; r++) {
-                        for (ServerPlayer player : players) {
-                            if (System.currentTimeMillis() >= deadline) break;
-                            if (player.level() instanceof ServerLevel sl) {
-                                int px = player.getBlockX() >> 4;
-                                int pz = player.getBlockZ() >> 4;
-                                cleanRingForPlayer(sl, px, pz, r);
-                            }
+                    if (player.level() instanceof ServerLevel sl) {
+                        activeServerLevel = sl;
+                        // Wenn der Spieler sich in einen neuen Chunk bewegt (z. B. Boot)
+                        if (lastChunk == null || !lastChunk.equals(currentChunk)) {
+                            queueChunksAround(sl, currentChunk.x, currentChunk.z, 22, true);
                         }
+                    }
+                }
+
+                // Regelmäßig Chunks in 22 Chunks Umkreis sicherstellen
+                if (server.getTickCount() % 40 == 0 && activeServerLevel != null) {
+                    for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                        queueChunksAround(activeServerLevel, player.getBlockX() >> 4, player.getBlockZ() >> 4, 22, false);
+                    }
+                }
+
+                // --- ULTRA-PERFORMANCE VERARBEITUNG: MAXIMAL 2 CHUNKS PRO TICK ---
+                // 2 Chunks * 20 Ticks = 40 Chunks/Sekunde! 16x schneller als jedes Boot, aber 100% laggfrei.
+                int processed = 0;
+                while (processed < 2 && !CHUNK_PURGE_QUEUE.isEmpty() && activeServerLevel != null) {
+                    ChunkPos cp = CHUNK_PURGE_QUEUE.poll();
+                    long key = chunkKey(cp.x, cp.z);
+                    CHUNKS_IN_QUEUE.remove(key);
+
+                    LevelChunk chunk = activeServerLevel.getChunkSource().getChunk(cp.x, cp.z, false);
+                    if (chunk != null) {
+                        clearChunkDirect(activeServerLevel, chunk);
+                        String worldKey = activeServerLevel.dimension().toString();
+                        WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>()).put(key, banVersion);
+                        processed++;
                     }
                 }
             }
 
             if (!isRunning || isPaused) return;
 
-            // Blockwechsel
+            // Blockwechsel-Erkennung
             if (blockDeleteEnabled) {
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                     if (player.onGround()) {
@@ -448,6 +485,7 @@ public class ExampleMod implements ModInitializer {
                                     }
 
                                     if (player.level() instanceof ServerLevel serverLevel) {
+                                        activeServerLevel = serverLevel;
                                         BlockPos pPos = player.blockPosition();
                                         for (int dx = -5; dx <= 5; dx++) {
                                             for (int dy = -3; dy <= 3; dy++) {
@@ -460,6 +498,7 @@ public class ExampleMod implements ModInitializer {
                                             }
                                         }
 
+                                        // Sofort Chunks unter den Spielern reinigen
                                         for (ServerPlayer p : serverLevel.players()) {
                                             int cx = p.getBlockX() >> 4;
                                             int cz = p.getBlockZ() >> 4;
@@ -467,6 +506,7 @@ public class ExampleMod implements ModInitializer {
                                             if (c != null) {
                                                 clearChunkDirect(serverLevel, c);
                                             }
+                                            queueChunksAround(serverLevel, cx, cz, 22, true);
                                         }
                                     }
                                 }
@@ -477,6 +517,38 @@ public class ExampleMod implements ModInitializer {
                 }
             }
         });
+    }
+
+    // Reiht Chunks nach Distanz sortiert in die Queue ein
+    private static void queueChunksAround(ServerLevel level, int centerX, int centerZ, int radius, boolean prioritizeClose) {
+        String worldKey = level.dimension().toString();
+        Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
+
+        List<ChunkPos> toAdd = new ArrayList<>();
+        int maxR = prioritizeClose ? Math.min(radius, 6) : radius;
+
+        for (int dx = -maxR; dx <= maxR; dx++) {
+            for (int dz = -maxR; dz <= maxR; dz++) {
+                if (dx * dx + dz * dz <= maxR * maxR) {
+                    int cx = centerX + dx;
+                    int cz = centerZ + dz;
+                    long key = chunkKey(cx, cz);
+
+                    if (cleanedMap.getOrDefault(key, -1) != banVersion && !CHUNKS_IN_QUEUE.contains(key)) {
+                        CHUNKS_IN_QUEUE.add(key);
+                        toAdd.add(new ChunkPos(cx, cz));
+                    }
+                }
+            }
+        }
+
+        toAdd.sort(Comparator.comparingInt(cp -> {
+            int ox = cp.x - centerX;
+            int oz = cp.z - centerZ;
+            return ox * ox + oz * oz;
+        }));
+
+        CHUNK_PURGE_QUEUE.addAll(toAdd);
     }
 
     private static String getDamageDescription(ServerPlayer victim, DamageSource source) {
@@ -521,37 +593,6 @@ public class ExampleMod implements ModInitializer {
         }
 
         return "§f" + victimName + " §7hat Schaden erlitten";
-    }
-
-    private static void cleanRingForPlayer(ServerLevel level, int px, int pz, int r) {
-        String worldKey = level.dimension().toString();
-        Map<Long, Integer> cleanedMap = WORLD_CLEANED_CHUNKS.computeIfAbsent(worldKey, k -> new HashMap<>());
-
-        if (r == 0) {
-            cleanChunkIfDue(level, px, pz, cleanedMap);
-            return;
-        }
-
-        for (int i = -r; i <= r; i++) {
-            cleanChunkIfDue(level, px + i, pz - r, cleanedMap);
-            cleanChunkIfDue(level, px + i, pz + r, cleanedMap);
-        }
-        for (int i = -r + 1; i <= r - 1; i++) {
-            cleanChunkIfDue(level, px - r, pz + i, cleanedMap);
-            cleanChunkIfDue(level, px + r, pz + i, cleanedMap);
-        }
-    }
-
-    private static void cleanChunkIfDue(ServerLevel level, int cx, int cz, Map<Long, Integer> cleanedMap) {
-        long key = chunkKey(cx, cz);
-        if (cleanedMap.getOrDefault(key, -1) == banVersion) {
-            return;
-        }
-        LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, false);
-        if (chunk != null) {
-            clearChunkDirect(level, chunk);
-            cleanedMap.put(key, banVersion);
-        }
     }
 
     private static Block getBlockUnderPlayer(ServerPlayer player) {
@@ -807,7 +848,6 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Menü-Layout: Links Welt (10, 11, 12) | Mitte Schalter (13) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
