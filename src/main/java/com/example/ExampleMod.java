@@ -22,7 +22,6 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
-import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
@@ -42,7 +41,6 @@ import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
-import java.lang.reflect.Field;
 import java.util.*;
 
 public class ExampleMod implements ModInitializer {
@@ -64,13 +62,15 @@ public class ExampleMod implements ModInitializer {
     public static boolean waterAllowed = true;
     public static boolean lavaAllowed = true;
 
-    // Stand-Block & Lebenspunkte pro Spieler
+    // Tracking pro Spieler
     private static final Map<UUID, Block> PLAYER_CURRENT_BLOCKS = new HashMap<>();
     private static final Map<UUID, Float> LAST_HEALTH_MAP = new HashMap<>();
+    private static final Map<UUID, ChunkPos> LAST_PLAYER_CHUNK = new HashMap<>();
 
-    // Performance Schockwellen-Queue (3ms Budget)
+    // Kontinuierliche Chunk-Bereinigung
+    private static final Set<Long> PURGED_CHUNKS = new HashSet<>();
+    private static final Set<Long> IN_QUEUE = new HashSet<>();
     private static final Queue<ChunkPos> PURGE_QUEUE = new LinkedList<>();
-    private static Block purgeTargetBlock = null;
     private static ServerLevel purgeLevel = null;
 
     // Host-System
@@ -118,36 +118,8 @@ public class ExampleMod implements ModInitializer {
         .append(createGradient("Challenge", 0xFF3838, 0xFFA800, true))
         .append(Component.literal(" §7» "));
 
-    // Versionsunabhängiges Setzen von GameRules ohne Chat-Feedback oder Rechteprobleme
-    public static void setGameRuleInternal(net.minecraft.server.MinecraftServer server, String ruleName, boolean value) {
-        try {
-            Object gameRules = server.getGameRules();
-            for (Field f : gameRules.getClass().getDeclaredFields()) {
-                if (Map.class.isAssignableFrom(f.getType())) {
-                    f.setAccessible(true);
-                    Map<?, ?> map = (Map<?, ?>) f.get(gameRules);
-                    if (map != null) {
-                        for (Map.Entry<?, ?> entry : map.entrySet()) {
-                            Object key = entry.getKey();
-                            Object val = entry.getValue();
-                            if (key != null && key.toString().equalsIgnoreCase(ruleName)) {
-                                for (Field vf : val.getClass().getDeclaredFields()) {
-                                    if (vf.getType() == boolean.class) {
-                                        vf.setAccessible(true);
-                                        vf.setBoolean(val, value);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (Exception ignored) {}
-    }
-
     @Override
     public void onInitialize() {
-        // Befehle registrieren
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(Commands.literal("challenge")
                 .executes(context -> {
@@ -212,12 +184,12 @@ public class ExampleMod implements ModInitializer {
 
                 player.setHealth(20.0f);
                 player.setGameMode(GameType.SPECTATOR);
-                return false; // Verhindert den Tod, den Respawn-Screen und die Vanilla-Chatnachricht
+                return false;
             }
             return true;
         });
 
-        // 2. Ghost-Item freies Platzieren verhinderter Blöcke
+        // 2. Platzieren verbotener Blöcke verbrennen
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -255,10 +227,10 @@ public class ExampleMod implements ModInitializer {
                 HOSTS.add(server.getPlayerList().getPlayers().get(0).getUUID());
             }
 
-            // GameRules sauber ohne Commands synchronisieren
+            // Gamerules sauber erzwingen
             if (server.getTickCount() % 40 == 0) {
-                setGameRuleInternal(server, "showDeathMessages", false);
-                setGameRuleInternal(server, "naturalRegeneration", !uhcMode);
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule showDeathMessages false");
+                server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
             }
 
             // Geteilte Herzen synchronisieren
@@ -280,20 +252,49 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Laggfreie Schockwelle mit strengem 3ms-Zeitbudget
-            if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
+            // --- LIVE BEWEGUNGS-RADAR FÜR ALLE SPIELER ---
+            if (!BANNED_BLOCKS.isEmpty()) {
+                for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                    ChunkPos currentChunk = player.chunkPosition();
+                    ChunkPos lastChunk = LAST_PLAYER_CHUNK.put(player.getUUID(), currentChunk);
+
+                    // Wenn Spieler sich in einen neuen Chunk bewegt (z. B. Boot, Laufen)
+                    if (lastChunk == null || !lastChunk.equals(currentChunk)) {
+                        if (player.level() instanceof ServerLevel sl) {
+                            queueChunksAroundPlayer(sl, currentChunk, 24);
+                        }
+                    }
+                }
+
+                // Alle 20 Ticks (1 Sekunde) Chunks prüfen, die neu geladen wurden
+                if (server.getTickCount() % 20 == 0) {
+                    for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                        if (player.level() instanceof ServerLevel sl) {
+                            queueChunksAroundPlayer(sl, player.chunkPosition(), 24);
+                        }
+                    }
+                }
+            }
+
+            // Queue mit 3ms Zeitbudget abarbeiten (konstante 20 TPS)
+            if (!PURGE_QUEUE.isEmpty() && purgeLevel != null) {
                 long deadline = System.currentTimeMillis() + 3;
                 while (!PURGE_QUEUE.isEmpty() && System.currentTimeMillis() < deadline) {
                     ChunkPos cp = PURGE_QUEUE.poll();
+                    long key = ChunkPos.asLong(cp.x(), cp.z());
+                    IN_QUEUE.remove(key);
+
                     LevelChunk chunk = purgeLevel.getChunkSource().getChunk(cp.x(), cp.z(), false);
                     if (chunk != null) {
-                        clearChunkDirect(purgeLevel, chunk, purgeTargetBlock);
+                        clearChunkDirect(purgeLevel, chunk);
+                        PURGED_CHUNKS.add(key);
                     }
                 }
             }
 
             if (!isRunning || isPaused) return;
 
+            // Blockwechsel-Logik
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                 if (player.onGround()) {
                     Block currentBlock = getBlockUnderPlayer(player);
@@ -329,8 +330,8 @@ public class ExampleMod implements ModInitializer {
                                         }
                                     }
 
-                                    // 28 Chunks Radius (über 440 Blöcke Sichtweite)
-                                    startSmoothRadialPurge(serverLevel, player.chunkPosition(), lastBlock, 28);
+                                    // Chunks neu einreihen für den neuen verbannten Block
+                                    triggerPurgeForNewBan(serverLevel);
                                 }
                             }
                             PLAYER_CURRENT_BLOCKS.put(player.getUUID(), currentBlock);
@@ -341,7 +342,56 @@ public class ExampleMod implements ModInitializer {
         });
     }
 
-    // Präzise Fuß-Kollision (behebt das Auslösen an Kanten und beim Sneaken)
+    // Setzt alle Chunks zurück und startet die 24-Chunk-Welle um alle Spieler
+    private static void triggerPurgeForNewBan(ServerLevel serverLevel) {
+        PURGED_CHUNKS.clear();
+        IN_QUEUE.clear();
+        PURGE_QUEUE.clear();
+
+        // Chunks direkt unter den Spielern sofort im gleichen Tick leeren
+        for (ServerPlayer p : serverLevel.players()) {
+            LevelChunk c = serverLevel.getChunkSource().getChunk(p.chunkPosition().x(), p.chunkPosition().z(), false);
+            if (c != null) {
+                clearChunkDirect(serverLevel, c);
+                PURGED_CHUNKS.add(ChunkPos.asLong(p.chunkPosition().x(), p.chunkPosition().z()));
+            }
+        }
+
+        // Alle umliegenden Chunks für alle Spieler in die Queue einreihen
+        for (ServerPlayer p : serverLevel.players()) {
+            queueChunksAroundPlayer(serverLevel, p.chunkPosition(), 24);
+        }
+    }
+
+    // Reiht unbereinigte Chunks um den Spieler nach Entfernung sortiert ein
+    private static void queueChunksAroundPlayer(ServerLevel level, ChunkPos center, int radius) {
+        if (BANNED_BLOCKS.isEmpty()) return;
+        purgeLevel = level;
+
+        List<ChunkPos> newChunks = new ArrayList<>();
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (dx * dx + dz * dz <= radius * radius) {
+                    int cx = center.x() + dx;
+                    int cz = center.z() + dz;
+                    long key = ChunkPos.asLong(cx, cz);
+                    if (!PURGED_CHUNKS.contains(key) && IN_QUEUE.add(key)) {
+                        newChunks.add(new ChunkPos(cx, cz));
+                    }
+                }
+            }
+        }
+
+        newChunks.sort(Comparator.comparingInt(cp -> {
+            int ox = cp.x() - center.x();
+            int oz = cp.z() - center.z();
+            return ox * ox + oz * oz;
+        }));
+
+        PURGE_QUEUE.addAll(newChunks);
+    }
+
+    // Fuß-Kollision (Kanten- & Sneak-Schutz)
     private static Block getBlockUnderPlayer(ServerPlayer player) {
         AABB aabb = player.getBoundingBox();
         AABB feetBox = new AABB(
@@ -386,7 +436,7 @@ public class ExampleMod implements ModInitializer {
         return bestBlock;
     }
 
-    // 100% synchrone Herzen: Kein Herzflackern, Heilung nur über Tränke & Goldäpfel
+    // Synchrone Herzen ohne Flackern
     private static void handleSharedHeartsSynchronized(net.minecraft.server.MinecraftServer server) {
         List<ServerPlayer> players = server.getPlayerList().getPlayers();
         if (players.size() < 2) {
@@ -431,7 +481,6 @@ public class ExampleMod implements ModInitializer {
                 }
             }
         } else {
-            // Verhindert unerlaubte Regeneration durch Hunger
             for (ServerPlayer p : players) {
                 if (p.isAlive() && p.getHealth() > currentSharedHealth) {
                     p.setHealth(currentSharedHealth);
@@ -446,7 +495,6 @@ public class ExampleMod implements ModInitializer {
         syncingHealth = false;
     }
 
-    // Sauberes Banner ohne Command-Rückmeldungen im Chat
     private static void triggerGameOver(net.minecraft.server.MinecraftServer server, ServerPlayer deadPlayer, Component deathReason) {
         isRunning = false;
         isPaused = false;
@@ -463,7 +511,6 @@ public class ExampleMod implements ModInitializer {
         server.getPlayerList().broadcastSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eGespielte Zeit: §a§l" + timeStr)), false);
         server.getPlayerList().broadcastSystemMessage(Component.literal("§c§m----------------------------------------"), false);
 
-        // Sound direkt per Java-Engine abspielen (keine Konsolenrückmeldungen im Chat)
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             p.setGameMode(GameType.SPECTATOR);
             p.setHealth(20.0f);
@@ -521,7 +568,6 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    // Menü-Layout: Links Welt-Systeme (10, 11, 12) | Rechts Modifier (14, 15, 16)
     private static void openChallengeMenu(ServerPlayer player) {
         Component menuTitle = Component.empty().append(createGradient("Challenge Menü", 0xFF3838, 0xFFA800, true));
 
@@ -546,24 +592,24 @@ public class ExampleMod implements ModInitializer {
                                 sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal(isPaused ? "§eChallenge pausiert!" : "§aChallenge fortgesetzt!")));
                             }
                             updateMenuIcons(container);
-                        } else if (slotId == 10) { // Wasser
+                        } else if (slotId == 10) {
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 11) { // Lava
+                        } else if (slotId == 11) {
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 12) { // Obsidian
+                        } else if (slotId == 12) {
                             toggleBlockWhitelist(Blocks.OBSIDIAN, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 14) { // Geteilte Herzen
+                        } else if (slotId == 14) {
                             toggleSharedHearts(sl.getServer(), sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 15) { // UHC
+                        } else if (slotId == 15) {
                             toggleUhc(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 16) { // Whitelist Buch
+                        } else if (slotId == 16) {
                             openWhitelistMenu(sp);
-                        } else if (slotId == 22) { // Meldungen
+                        } else if (slotId == 22) {
                             showBroadcasts = !showBroadcasts;
                             sp.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eChat-Meldungen §7» " + (showBroadcasts ? "§aAktiviert" : "§cDeaktiviert"))));
                             updateMenuIcons(container);
@@ -577,7 +623,6 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -692,8 +737,9 @@ public class ExampleMod implements ModInitializer {
 
     private static void toggleUhc(ServerLevel level, ServerPlayer player) {
         uhcMode = !uhcMode;
-        setGameRuleInternal(level.getServer(), "naturalRegeneration", !uhcMode);
-        level.getServer().getPlayerList().broadcastSystemMessage(
+        var server = level.getServer();
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), "gamerule naturalRegeneration " + (!uhcMode));
+        server.getPlayerList().broadcastSystemMessage(
             Component.empty().append(PREFIX).append(Component.literal("§eUltra Hardcore (UHC) §7» " + 
                 (uhcMode ? "§aAktiviert" : "§cDeaktiviert"))),
             false
@@ -751,7 +797,7 @@ public class ExampleMod implements ModInitializer {
         waterAllowed = !waterAllowed;
         if (!waterAllowed) {
             BANNED_BLOCKS.add(Blocks.WATER);
-            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.WATER, 28);
+            triggerPurgeForNewBan(level);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eWasser-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.WATER);
@@ -763,7 +809,7 @@ public class ExampleMod implements ModInitializer {
         lavaAllowed = !lavaAllowed;
         if (!lavaAllowed) {
             BANNED_BLOCKS.add(Blocks.LAVA);
-            startSmoothRadialPurge(level, player.chunkPosition(), Blocks.LAVA, 28);
+            triggerPurgeForNewBan(level);
             player.sendSystemMessage(Component.empty().append(PREFIX).append(Component.literal("§eLava-System §7» §cIn allen Chunks gelöscht & verbannt!")));
         } else {
             BANNED_BLOCKS.remove(Blocks.LAVA);
@@ -782,38 +828,8 @@ public class ExampleMod implements ModInitializer {
         }
     }
 
-    private static void startSmoothRadialPurge(ServerLevel level, ChunkPos center, Block targetBlock, int radius) {
-        LevelChunk centerChunk = level.getChunkSource().getChunk(center.x(), center.z(), false);
-        if (centerChunk != null) {
-            clearChunkDirect(level, centerChunk, targetBlock);
-        }
-
-        List<ChunkPos> chunks = new ArrayList<>();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dz = -radius; dz <= radius; dz++) {
-                if (dx == 0 && dz == 0) continue;
-                if (dx * dx + dz * dz <= radius * radius) {
-                    ChunkPos cp = new ChunkPos(center.x() + dx, center.z() + dz);
-                    if (level.getChunkSource().hasChunk(cp.x(), cp.z())) {
-                        chunks.add(cp);
-                    }
-                }
-            }
-        }
-
-        chunks.sort(Comparator.comparingInt(cp -> {
-            int ox = cp.x() - center.x();
-            int oz = cp.z() - center.z();
-            return ox * ox + oz * oz;
-        }));
-
-        PURGE_QUEUE.clear();
-        PURGE_QUEUE.addAll(chunks);
-        purgeTargetBlock = targetBlock;
-        purgeLevel = level;
-    }
-
-    private static void clearChunkDirect(ServerLevel level, LevelChunk chunk, Block specificBlock) {
+    // Bereinigt alle verbannten Blöcke in einem Chunk ohne Block-Updates
+    private static void clearChunkDirect(ServerLevel level, LevelChunk chunk) {
         LevelChunkSection[] sections = chunk.getSections();
         if (sections == null) return;
 
@@ -826,7 +842,7 @@ public class ExampleMod implements ModInitializer {
             LevelChunkSection section = sections[sIndex];
             if (section == null || section.hasOnlyAir()) continue;
 
-            if (!section.maybeHas(state -> (specificBlock != null) ? state.is(specificBlock) : BANNED_BLOCKS.contains(state.getBlock()))) {
+            if (!section.maybeHas(state -> BANNED_BLOCKS.contains(state.getBlock()))) {
                 continue;
             }
 
@@ -838,9 +854,7 @@ public class ExampleMod implements ModInitializer {
                         BlockState state = section.getBlockState(x, y, z);
                         Block b = state.getBlock();
 
-                        boolean shouldDelete = (specificBlock != null) ? (b == specificBlock) : BANNED_BLOCKS.contains(b);
-
-                        if (shouldDelete) {
+                        if (BANNED_BLOCKS.contains(b)) {
                             int worldY = sectionBottomY + y;
                             mPos.set(startX + x, worldY, startZ + z);
                             level.setBlock(mPos, Blocks.AIR.defaultBlockState(), 2 | 16);
