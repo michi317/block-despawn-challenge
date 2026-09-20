@@ -30,7 +30,6 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 import net.minecraft.world.level.ChunkPos;
-import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -191,7 +190,7 @@ public class ExampleMod implements ModInitializer {
             );
         });
 
-        // 1. Ghost-Item freies Platzieren
+        // 1. Ghost-Item freies Platzieren verhinderter Blöcke
         UseBlockCallback.EVENT.register((player, level, hand, hitResult) -> {
             ItemStack stack = player.getItemInHand(hand);
             if (stack.getItem() instanceof BlockItem blockItem) {
@@ -233,7 +232,7 @@ public class ExampleMod implements ModInitializer {
                     timerSeconds++;
                 }
 
-                // Geteilte Herzen Logik
+                // Geteilte Herzen synchronisieren
                 if (sharedHearts && !syncingHealth) {
                     handleSharedHearts(server);
                 }
@@ -245,7 +244,7 @@ public class ExampleMod implements ModInitializer {
                 updateActionBar(server);
             }
 
-            // Schnelle Schockwelle
+            // Schnelle Schockwellen-Verarbeitung
             if (!PURGE_QUEUE.isEmpty() && purgeLevel != null && purgeTargetBlock != null) {
                 for (int i = 0; i < 16 && !PURGE_QUEUE.isEmpty(); i++) {
                     ChunkPos cp = PURGE_QUEUE.poll();
@@ -357,7 +356,6 @@ public class ExampleMod implements ModInitializer {
             }
         }
 
-        // Falls alle tot sind oder respawnen
         boolean anyAlive = false;
         for (ServerPlayer p : players) {
             if (p.isAlive()) {
@@ -458,13 +456,13 @@ public class ExampleMod implements ModInitializer {
                         } else if (slotId == 10) {
                             toggleWater(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 11) { // Geteilte Herzen Toggle
+                        } else if (slotId == 11) {
                             toggleSharedHearts(sl.getServer(), sp);
                             updateMenuIcons(container);
                         } else if (slotId == 12) {
                             toggleLava(sl, sp);
                             updateMenuIcons(container);
-                        } else if (slotId == 13) { // UHC Toggle
+                        } else if (slotId == 13) {
                             toggleUhc(sl, sp);
                             updateMenuIcons(container);
                         } else if (slotId == 14) {
@@ -486,7 +484,6 @@ public class ExampleMod implements ModInitializer {
     }
 
     private static void updateMenuIcons(SimpleContainer container) {
-        // Slot 4: Controller
         ItemStack ctrlItem;
         if (!isRunning) {
             ctrlItem = new ItemStack(Items.CLOCK);
@@ -515,7 +512,6 @@ public class ExampleMod implements ModInitializer {
         }
         container.setItem(4, ctrlItem);
 
-        // Slot 10: Wasser
         boolean waterOk = WHITELIST.contains(Blocks.WATER);
         ItemStack waterItem = new ItemStack(Items.WATER_BUCKET);
         waterItem.set(DataComponents.CUSTOM_NAME, Component.literal("§b§lWasser-System"));
@@ -526,7 +522,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(10, waterItem);
 
-        // Slot 11: Geteilte Herzen
         ItemStack heartsItem = new ItemStack(Items.GOLDEN_APPLE);
         heartsItem.set(DataComponents.CUSTOM_NAME, Component.literal(sharedHearts ? "§c§lGeteilte Herzen: AN" : "§7§lGeteilte Herzen: AUS"));
         heartsItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -537,7 +532,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(11, heartsItem);
 
-        // Slot 12: Lava
         boolean lavaOk = WHITELIST.contains(Blocks.LAVA);
         ItemStack lavaItem = new ItemStack(Items.LAVA_BUCKET);
         lavaItem.set(DataComponents.CUSTOM_NAME, Component.literal("§6§lLava-System"));
@@ -548,7 +542,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(12, lavaItem);
 
-        // Slot 13: Ultra Hardcore (UHC)
         ItemStack uhcItem = new ItemStack(Items.GOLDEN_CARROT);
         uhcItem.set(DataComponents.CUSTOM_NAME, Component.literal(uhcMode ? "§6§lUltra Hardcore (UHC): AN" : "§7§lUltra Hardcore (UHC): AUS"));
         uhcItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -560,7 +553,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(13, uhcItem);
 
-        // Slot 14: Obsidian
         boolean obsOk = WHITELIST.contains(Blocks.OBSIDIAN);
         ItemStack obsItem = new ItemStack(Blocks.OBSIDIAN.asItem());
         obsItem.set(DataComponents.CUSTOM_NAME, Component.literal("§5§lObsidian-Schutz"));
@@ -571,7 +563,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(14, obsItem);
 
-        // Slot 16: Whitelist GUI
         ItemStack bookItem = new ItemStack(Items.BOOK);
         bookItem.set(DataComponents.CUSTOM_NAME, Component.literal("§d§lWhitelist Übersicht"));
         bookItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -581,7 +572,6 @@ public class ExampleMod implements ModInitializer {
         )));
         container.setItem(16, bookItem);
 
-        // Slot 22: Nachrichten
         ItemStack msgItem = new ItemStack(Items.NAME_TAG);
         msgItem.set(DataComponents.CUSTOM_NAME, Component.literal(showBroadcasts ? "§a§lChat-Meldungen: AN" : "§c§lChat-Meldungen: AUS"));
         msgItem.set(DataComponents.LORE, new ItemLore(List.of(
@@ -615,8 +605,9 @@ public class ExampleMod implements ModInitializer {
 
     private static void toggleUhc(ServerLevel level, ServerPlayer player) {
         uhcMode = !uhcMode;
-        level.getServer().getGameRules().getRule(GameRules.RULE_NATURAL_REGENERATION).set(!uhcMode, level.getServer());
-        level.getServer().getPlayerList().broadcastSystemMessage(
+        var server = level.getServer();
+        server.getCommands().performPrefixedCommand(server.createCommandSourceStack(), "gamerule naturalRegeneration " + (!uhcMode));
+        server.getPlayerList().broadcastSystemMessage(
             Component.empty().append(PREFIX).append(Component.literal("§6§lUltra Hardcore (UHC): " + 
                 (uhcMode ? "§aAktiviert §8(Keine natürliche Regeneration!)" : "§cDeaktiviert"))),
             false
